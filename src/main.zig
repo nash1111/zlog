@@ -127,6 +127,61 @@ const RouteGraph = struct {
     }
 };
 
+const AssetKind = enum { page_asset, site_asset, build_asset };
+
+const Asset = struct {
+    kind: AssetKind,
+    owner_path: []const u8 = "",
+    source_path: []const u8 = "",
+    url: []const u8,
+    out_path: []const u8,
+};
+
+const AssetGraph = struct {
+    allocator: std.mem.Allocator,
+    assets: std.array_list.Managed(Asset),
+    owned_strings: std.array_list.Managed([]const u8),
+
+    fn init(allocator: std.mem.Allocator) AssetGraph {
+        return .{
+            .allocator = allocator,
+            .assets = std.array_list.Managed(Asset).init(allocator),
+            .owned_strings = std.array_list.Managed([]const u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *AssetGraph) void {
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit();
+        self.assets.deinit();
+    }
+
+    fn own(self: *AssetGraph, s: []const u8) ![]const u8 {
+        errdefer self.allocator.free(s);
+        try self.owned_strings.append(s);
+        return s;
+    }
+
+    fn add(self: *AssetGraph, asset: Asset) !void {
+        try self.assets.append(asset);
+    }
+
+    fn countByKind(self: AssetGraph, kind: AssetKind) usize {
+        var count: usize = 0;
+        for (self.assets.items) |asset| {
+            if (asset.kind == kind) count += 1;
+        }
+        return count;
+    }
+
+    fn firstByKindAndUrl(self: AssetGraph, kind: AssetKind, url: []const u8) ?Asset {
+        for (self.assets.items) |asset| {
+            if (asset.kind == kind and std.mem.eql(u8, asset.url, url)) return asset;
+        }
+        return null;
+    }
+};
+
 const CliError = error{Usage};
 const default_dev_port: u16 = 1111;
 const watch_poll_interval_ms: i64 = 750;
@@ -222,11 +277,13 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     defer pages.deinit();
     var routes = try buildRouteGraph(allocator, dir, site, pages.items);
     defer routes.deinit();
+    var assets = try buildAssetGraph(allocator, pages.items, routes);
+    defer assets.deinit();
     try validatePages(allocator, pages.items, routes);
 
     const out_dir = try join(allocator, &.{ dir, site.out_dir });
     try cleanAndCreate(out_dir);
-    try copyStaticRoutes(allocator, routes);
+    try copySiteAssets(allocator, assets);
 
     const post_list = try renderPostList(allocator, pages.items, site);
     const head = renderHead(site);
@@ -1300,6 +1357,70 @@ fn addStaticRoutes(allocator: std.mem.Allocator, graph: *RouteGraph, static_dir:
     }
 }
 
+fn buildAssetGraph(allocator: std.mem.Allocator, pages: []Page, routes: RouteGraph) !AssetGraph {
+    var graph = AssetGraph.init(allocator);
+    errdefer graph.deinit();
+
+    for (routes.routes.items) |route| {
+        switch (route.kind) {
+            .static_asset => try addRouteAsset(&graph, .site_asset, "", route),
+            .page, .post, .tag, .archive, .rss, .sitemap => try addRouteAsset(&graph, .build_asset, routeOwnerPath(pages, route), route),
+        }
+    }
+
+    for (pages) |page| {
+        if (page.fm.draft) continue;
+        try addPageReferencedAssets(allocator, &graph, page, routes);
+    }
+
+    return graph;
+}
+
+fn addRouteAsset(graph: *AssetGraph, kind: AssetKind, owner_path: []const u8, route: Route) !void {
+    try graph.add(.{
+        .kind = kind,
+        .owner_path = try assetOwnCopy(graph, owner_path),
+        .source_path = try assetOwnCopy(graph, route.source_path),
+        .url = try assetOwnCopy(graph, route.url),
+        .out_path = try assetOwnCopy(graph, route.out_path),
+    });
+}
+
+fn addPageReferencedAssets(allocator: std.mem.Allocator, graph: *AssetGraph, page: Page, routes: RouteGraph) !void {
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, page.markdown, offset, "](")) |idx| {
+        const destination_start = idx + 2;
+        const rest = page.markdown[destination_start..];
+        const end = std.mem.indexOfScalar(u8, rest, ')') orelse break;
+        const destination = markdownLinkDestination(rest[0..end]);
+        if (try resolveInternalLink(allocator, page.url, destination)) |link| {
+            defer link.deinit(allocator);
+            if (urlPathHasExtension(link.path)) {
+                if (findRouteForLink(routes, link.path)) |route| {
+                    if (route.kind == .static_asset) try graph.add(.{
+                        .kind = .page_asset,
+                        .owner_path = try assetOwnCopy(graph, page.source_path),
+                        .source_path = try assetOwnCopy(graph, route.source_path),
+                        .url = try assetOwnCopy(graph, route.url),
+                        .out_path = try assetOwnCopy(graph, route.out_path),
+                    });
+                }
+            }
+        }
+        offset = destination_start + end + 1;
+    }
+}
+
+fn routeOwnerPath(pages: []Page, route: Route) []const u8 {
+    if (route.kind != .page and route.kind != .post) return "";
+    const page = findPageByUrl(pages, route.url) orelse return "";
+    return page.source_path;
+}
+
+fn assetOwnCopy(graph: *AssetGraph, value: []const u8) ![]const u8 {
+    return graph.own(try graph.allocator.dupe(u8, value));
+}
+
 fn outputRelForUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     if (std.mem.eql(u8, url, "/")) return allocator.dupe(u8, "index.html");
     if (std.mem.endsWith(u8, url, ".xml") or std.mem.endsWith(u8, url, ".json")) return allocator.dupe(u8, std.mem.trimStart(u8, url, "/"));
@@ -1320,12 +1441,12 @@ fn findRoute(routes: RouteGraph, kind: RouteKind, url: []const u8) ?Route {
     return null;
 }
 
-fn copyStaticRoutes(allocator: std.mem.Allocator, routes: RouteGraph) !void {
-    for (routes.routes.items) |route| {
-        if (route.kind != .static_asset) continue;
-        const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io, route.source_path, allocator, .limited(32 * 1024 * 1024));
+fn copySiteAssets(allocator: std.mem.Allocator, assets: AssetGraph) !void {
+    for (assets.assets.items) |asset| {
+        if (asset.kind != .site_asset) continue;
+        const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io, asset.source_path, allocator, .limited(32 * 1024 * 1024));
         defer allocator.free(data);
-        try writeAll(allocator, route.out_path, data);
+        try writeAll(allocator, asset.out_path, data);
     }
 }
 
@@ -2077,8 +2198,11 @@ test "static assets are copied recursively without changing bytes" {
 
     var routes = try buildRouteGraph(std.testing.allocator, root, .{}, &.{});
     defer routes.deinit();
+    var assets = try buildAssetGraph(std.testing.allocator, &.{}, routes);
+    defer assets.deinit();
     try std.testing.expect(routes.containsUrl("/assets/icons/logo.bin"));
-    try copyStaticRoutes(std.testing.allocator, routes);
+    try std.testing.expect(assets.firstByKindAndUrl(.site_asset, "/assets/icons/logo.bin") != null);
+    try copySiteAssets(std.testing.allocator, assets);
 
     const copied_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/public/assets/icons/logo.bin", .{root});
     defer std.testing.allocator.free(copied_path);
@@ -2131,6 +2255,29 @@ test "internal link validation resolves anchors route variants relative links an
 
     var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
     defer routes.deinit();
+    var assets = try buildAssetGraph(std.testing.allocator, pages[0..], routes);
+    defer assets.deinit();
+    const page_asset = assets.firstByKindAndUrl(.page_asset, "/app.css").?;
+    const site_asset = assets.firstByKindAndUrl(.site_asset, "/app.css").?;
+    const build_asset = assets.firstByKindAndUrl(.build_asset, "/").?;
+    const static_source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/static/app.css", .{root});
+    defer std.testing.allocator.free(static_source_path);
+    const static_out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/public/app.css", .{root});
+    defer std.testing.allocator.free(static_out_path);
+    const page_out_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/public/index.html", .{root});
+    defer std.testing.allocator.free(page_out_path);
+    try std.testing.expectEqualStrings("content/index.md", page_asset.owner_path);
+    try std.testing.expectEqualStrings(static_source_path, page_asset.source_path);
+    try std.testing.expectEqualStrings("/app.css", page_asset.url);
+    try std.testing.expectEqualStrings(static_out_path, page_asset.out_path);
+    try std.testing.expectEqualStrings("", site_asset.owner_path);
+    try std.testing.expectEqualStrings(static_source_path, site_asset.source_path);
+    try std.testing.expectEqualStrings(static_out_path, site_asset.out_path);
+    try std.testing.expectEqualStrings("content/index.md", build_asset.owner_path);
+    try std.testing.expectEqualStrings(page_out_path, build_asset.out_path);
+    try std.testing.expect(assets.countByKind(.site_asset) >= 1);
+    try std.testing.expect(assets.countByKind(.build_asset) >= 1);
+    try std.testing.expect(assets.countByKind(.page_asset) >= 1);
     try validatePages(std.testing.allocator, pages[0..], routes);
 }
 
