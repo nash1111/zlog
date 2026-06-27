@@ -4,6 +4,8 @@
 .date = "2026-06-23T00:00:00+09:00",
 .updated = "2026-06-24T00:00:00+09:00",
 .tags = ["zig", "ssg"],
+.categories = ["Engineering"],
+.series = ["Building zlog"],
 .layout = "post.shtml",
 .draft = false,
 .prefetch = "hover",
