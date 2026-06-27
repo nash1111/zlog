@@ -113,5 +113,5 @@ rejected during template rendering.
 Generated pages include:
 
 - `@view-transition { navigation: auto; }` CSS.
-- `script type="speculationrules"` rules for `tap` and `hover` links.
+- RouteGraph-derived `script type="speculationrules"` document rules for known internal `tap` and `hover` links.
 - a tiny JS fallback for `hover`, `tap`, `viewport`, and `load` prefetch values.

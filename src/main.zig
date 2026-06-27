@@ -319,7 +319,7 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     try copySiteAssets(allocator, assets);
 
     const post_list = try renderPostList(allocator, pages.items, site);
-    const head = try renderHead(allocator, site);
+    const head = try renderHead(allocator, site, routes);
     defer allocator.free(head);
     const runtime = prefetchRuntime;
 
@@ -585,7 +585,7 @@ fn loadLayoutForPage(allocator: std.mem.Allocator, dir: []const u8, site: SiteCo
 
 fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph, assets: AssetGraph) !void {
     const post_list = try renderPostList(allocator, pages, site);
-    const head = try renderHead(allocator, site);
+    const head = try renderHead(allocator, site, routes);
     defer allocator.free(head);
     const runtime = prefetchRuntime;
 
@@ -2386,7 +2386,7 @@ fn renderTaxonomiesInline(allocator: std.mem.Allocator, page: Page) ![]const u8 
     return out.toOwnedSlice();
 }
 
-fn renderHead(allocator: std.mem.Allocator, site: SiteConfig) ![]const u8 {
+fn renderHead(allocator: std.mem.Allocator, site: SiteConfig, routes: RouteGraph) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     try out.appendSlice(
@@ -2409,12 +2409,62 @@ fn renderHead(allocator: std.mem.Allocator, site: SiteConfig) ![]const u8 {
         try out.appendSlice("\">\n");
     }
     if (site.speculation_rules) {
-        try out.appendSlice(
-            \\<script type="speculationrules">{"prefetch":[{"where":{"selector_matches":"[data-z-prefetch='tap']"},"eagerness":"conservative"},{"where":{"selector_matches":"[data-z-prefetch='hover']"},"eagerness":"moderate"}]}</script>
-            \\
-        );
+        const rules = try renderSpeculationRules(allocator, routes);
+        defer allocator.free(rules);
+        try out.appendSlice(rules);
     }
     return out.toOwnedSlice();
+}
+
+fn renderSpeculationRules(allocator: std.mem.Allocator, routes: RouteGraph) ![]const u8 {
+    var targets = std.array_list.Managed([]const u8).init(allocator);
+    defer targets.deinit();
+
+    for (routes.routes.items) |route| {
+        if (includeInPrefetchTargets(route)) try targets.append(route.url);
+    }
+    if (targets.items.len == 0) return allocator.dupe(u8, "");
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("<script type=\"speculationrules\">{\"prefetch\":[");
+    try appendSpeculationRule(&out, "[data-z-prefetch='tap']", "conservative", targets.items);
+    try out.append(',');
+    try appendSpeculationRule(&out, "[data-z-prefetch='hover']", "moderate", targets.items);
+    try out.appendSlice("]}</script>\n");
+    return out.toOwnedSlice();
+}
+
+fn appendSpeculationRule(out: *std.array_list.Managed(u8), selector: []const u8, eagerness: []const u8, targets: []const []const u8) !void {
+    try out.appendSlice("{\"source\":\"document\",\"where\":{\"and\":[{\"selector_matches\":\"");
+    try appendJsonEscaped(out, selector);
+    try out.appendSlice("\"},{\"href_matches\":[");
+    for (targets, 0..) |target, index| {
+        if (index > 0) try out.append(',');
+        try out.append('"');
+        try appendJsonEscaped(out, target);
+        try out.append('"');
+    }
+    try out.appendSlice("]},{\"not\":{\"selector_matches\":\"");
+    try appendJsonEscaped(out, unsafePrefetchSelector);
+    try out.appendSlice("\"}}]},\"eagerness\":\"");
+    try appendJsonEscaped(out, eagerness);
+    try out.appendSlice("\"}");
+}
+
+const unsafePrefetchSelector =
+    "a[download],a[target],a[href*='?logout='],a[href*='&logout='],a[href*='?admin='],a[href*='&admin='],a[href*='?search='],a[href*='&search=']";
+
+fn includeInPrefetchTargets(route: Route) bool {
+    if (!isSafePrefetchUrl(route.url)) return false;
+    return includeInHtmlRouteManifest(route);
+}
+
+fn isSafePrefetchUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "/") and
+        !std.mem.startsWith(u8, url, "//") and
+        std.mem.indexOfScalar(u8, url, '?') == null and
+        std.mem.indexOfScalar(u8, url, '#') == null;
 }
 
 const prefetchRuntime =
@@ -2817,6 +2867,10 @@ fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page
 }
 
 fn includeInSitemap(route: Route) bool {
+    return includeInHtmlRouteManifest(route);
+}
+
+fn includeInHtmlRouteManifest(route: Route) bool {
     return switch (route.kind) {
         .page, .post, .index_page, .tag, .tag_page, .taxonomy, .taxonomy_page, .archive, .archive_page => true,
         .rss, .sitemap, .static_asset => false,
@@ -3031,6 +3085,32 @@ fn appendXmlEscaped(out: *std.array_list.Managed(u8), text: []const u8) !void {
     try appendEscaped(out, text);
 }
 
+fn appendJsonEscaped(out: *std.array_list.Managed(u8), text: []const u8) !void {
+    for (text) |c| {
+        if (c < 0x20) {
+            switch (c) {
+                '\n' => try out.appendSlice("\\n"),
+                '\r' => try out.appendSlice("\\r"),
+                '\t' => try out.appendSlice("\\t"),
+                else => {
+                    const hex = "0123456789abcdef";
+                    const hi: usize = @intCast(c >> 4);
+                    const lo: usize = @intCast(c & 0x0f);
+                    try out.appendSlice("\\u00");
+                    try out.append(hex[hi]);
+                    try out.append(hex[lo]);
+                },
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => try out.appendSlice("\\\""),
+            '\\' => try out.appendSlice("\\\\"),
+            else => try out.append(c),
+        }
+    }
+}
+
 fn appendEscapedChar(out: *std.array_list.Managed(u8), c: u8) !void {
     switch (c) {
         '&' => try out.appendSlice("&amp;"),
@@ -3172,7 +3252,9 @@ test "site config reads metadata fields and renders head metadata" {
     try std.testing.expectEqualStrings("/:slug/", site.permalink);
     try std.testing.expectEqual(@as(usize, 3), site.page_size);
 
-    const head = try renderHead(std.testing.allocator, site);
+    var routes = RouteGraph.init(std.testing.allocator);
+    defer routes.deinit();
+    const head = try renderHead(std.testing.allocator, site, routes);
     defer std.testing.allocator.free(head);
     try std.testing.expect(std.mem.indexOf(u8, head, "<meta name=\"author\" content=\"Example Author\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, head, "<meta name=\"zlog:timezone\" content=\"+09:00\">") != null);
@@ -3372,6 +3454,36 @@ test "sitemap output uses absolute urls and reliable lastmod" {
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/rss.xml") == null);
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/sitemap.xml") == null);
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/app.css") == null);
+}
+
+test "speculation rules use safe route graph targets" {
+    var routes = RouteGraph.init(std.testing.allocator);
+    defer routes.deinit();
+    try routes.add(.{ .kind = .page, .url = "/", .out_path = "" });
+    try routes.add(.{ .kind = .post, .url = "/posts/live/", .out_path = "" });
+    try routes.add(.{ .kind = .index_page, .url = "/page/2/", .out_path = "" });
+    try routes.add(.{ .kind = .tag, .url = "/tags/zig/", .out_path = "" });
+    try routes.add(.{ .kind = .taxonomy, .url = "/categories/engineering/", .out_path = "" });
+    try routes.add(.{ .kind = .archive, .url = "/archive/", .out_path = "" });
+    try routes.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = "" });
+    try routes.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = "" });
+    try routes.add(.{ .kind = .static_asset, .url = "/app.css", .out_path = "" });
+    try routes.add(.{ .kind = .page, .url = "https://example.com/offsite/", .out_path = "" });
+    try routes.add(.{ .kind = .page, .url = "/admin/?logout=1", .out_path = "" });
+
+    const rules = try renderSpeculationRules(std.testing.allocator, routes);
+    defer std.testing.allocator.free(rules);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "type=\"speculationrules\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "\"source\":\"document\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "\"selector_matches\":\"[data-z-prefetch='tap']\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "\"selector_matches\":\"[data-z-prefetch='hover']\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "\"href_matches\":[\"/\",\"/posts/live/\",\"/page/2/\",\"/tags/zig/\",\"/categories/engineering/\",\"/archive/\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "a[download],a[target]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "/rss.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "/sitemap.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "/app.css") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "https://example.com/offsite/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "/admin/?logout=1") == null);
 }
 
 test "route graph centralizes published routes and static assets" {
