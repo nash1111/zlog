@@ -160,6 +160,7 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     const runtime = prefetchRuntime;
 
     for (pages.items) |page| {
+        if (page.fm.draft) continue;
         const layout_name = if (page.fm.layout.len == 0) "base.shtml" else page.fm.layout;
         const layout_path = try join(allocator, &.{ dir, site.layouts_dir, layout_name });
         const layout = std.Io.Dir.cwd().readFileAlloc(runtime_io, layout_path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
@@ -177,7 +178,7 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     try renderArchivePage(allocator, out_dir, pages.items, site, head, runtime);
     try writeAll(allocator, try join(allocator, &.{ out_dir, "rss.xml" }), try renderRss(allocator, pages.items, site));
     try writeAll(allocator, try join(allocator, &.{ out_dir, "sitemap.xml" }), try renderSitemap(allocator, pages.items));
-    try stdout("built {d} pages into {s}\n", .{ pages.items.len, out_dir });
+    try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
 }
 
 fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
@@ -756,13 +757,13 @@ fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const
 
 fn renderTagPages(allocator: std.mem.Allocator, out_dir: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     var seen = std.StringHashMap(void).init(allocator);
-    for (pages) |p| if (p.is_post) for (p.fm.tags) |tag| {
+    for (pages) |p| if (p.is_post and !p.fm.draft) for (p.fm.tags) |tag| {
         const tag_slug = try slugify(allocator, tag);
         if (seen.contains(tag_slug)) continue;
         try seen.put(tag_slug, {});
         var body = std.array_list.Managed(u8).init(allocator);
         try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
-        for (pages) |q| if (q.is_post and hasTag(q, tag)) {
+        for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
             try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
         };
         try body.appendSlice("</ul>");
@@ -776,7 +777,7 @@ fn renderTagPages(allocator: std.mem.Allocator, out_dir: []const u8, pages: []Pa
 fn renderArchivePage(allocator: std.mem.Allocator, out_dir: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     var body = std.array_list.Managed(u8).init(allocator);
     try body.appendSlice("<h1>Archive</h1>\n<ul>\n");
-    for (pages) |p| if (p.is_post) try body.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ p.fm.date, p.url, p.fm.title });
+    for (pages) |p| if (p.is_post and !p.fm.draft) try body.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ p.fm.date, p.url, p.fm.title });
     try body.appendSlice("</ul>");
     const fake = Page{ .source_path = "", .slug = "archive", .url = "/archive/", .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
     const rendered = try renderLayout(allocator, initBaseLayout, site, fake, try body.toOwnedSlice(), "", head, runtime);
@@ -786,7 +787,7 @@ fn renderArchivePage(allocator: std.mem.Allocator, out_dir: []const u8, pages: [
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     try out.print("<?xml version=\"1.0\" encoding=\"utf-8\"?><rss version=\"2.0\"><channel><title>{s}</title>", .{site.title});
-    for (pages) |p| if (p.is_post) try out.print("<item><title>{s}</title><link>{s}</link><pubDate>{s}</pubDate></item>", .{ p.fm.title, p.url, p.fm.date });
+    for (pages) |p| if (p.is_post and !p.fm.draft) try out.print("<item><title>{s}</title><link>{s}</link><pubDate>{s}</pubDate></item>", .{ p.fm.title, p.url, p.fm.date });
     try out.appendSlice("</channel></rss>\n");
     return out.toOwnedSlice();
 }
@@ -794,9 +795,17 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
 fn renderSitemap(allocator: std.mem.Allocator, pages: []Page) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     try out.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">");
-    for (pages) |p| try out.print("<url><loc>{s}</loc></url>", .{p.url});
+    for (pages) |p| if (!p.fm.draft) try out.print("<url><loc>{s}</loc></url>", .{p.url});
     try out.appendSlice("</urlset>\n");
     return out.toOwnedSlice();
+}
+
+fn countPublishedPages(pages: []Page) usize {
+    var count: usize = 0;
+    for (pages) |page| {
+        if (!page.fm.draft) count += 1;
+    }
+    return count;
 }
 
 fn hasTag(page: Page, tag: []const u8) bool {
@@ -1002,6 +1011,19 @@ test "page schema applies defaults without post date" {
     try std.testing.expectEqualStrings("", fm.date);
     try std.testing.expectEqualStrings("base.shtml", fm.layout);
     try std.testing.expect(!fm.draft);
+}
+
+test "draft pages are excluded from published outputs" {
+    var pages = [_]Page{
+        .{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false },
+        .{ .source_path = "content/posts/live.md", .slug = "live", .url = "/live/", .fm = .{ .title = "Live", .date = "2026-06-27" }, .markdown = "", .html = "", .is_post = true },
+        .{ .source_path = "content/posts/draft.md", .slug = "draft", .url = "/draft/", .fm = .{ .title = "Draft", .date = "2026-06-27", .draft = true }, .markdown = "", .html = "", .is_post = true },
+    };
+    try std.testing.expectEqual(@as(usize, 2), countPublishedPages(pages[0..]));
+    const rss = try renderRss(std.testing.allocator, pages[0..], .{ .title = "Site" });
+    defer std.testing.allocator.free(rss);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "Live") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "Draft") == null);
 }
 
 test "markdown renderer emits headings paragraphs and links" {

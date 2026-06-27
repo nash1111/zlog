@@ -55,6 +55,16 @@ Ziggy-like frontmatter is supported for the MVP:
 # Hello
 ```
 
+## Draft content
+
+Set `.draft = true` to keep a page or post out of production output. Draft
+content is skipped when writing HTML pages and is also omitted from index, tag,
+archive, RSS, and sitemap output.
+
+The current `zlog dev` command rebuilds once through the same production output
+path, so it does not publish drafts locally. A future preview mode can add an
+explicit draft flag without changing production behavior.
+
 ## Template tokens
 
 The MVP uses small HTML-first token replacement instead of a full SuperHTML renderer:
