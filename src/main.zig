@@ -693,7 +693,7 @@ fn validatePages(allocator: std.mem.Allocator, pages: []Page, routes: RouteGraph
         if (page.fm.title.len == 0) return fail("missing .title in {s}", .{page.source_path});
         if (page.is_post and page.fm.date.len == 0) return fail("missing .date in post {s}", .{page.source_path});
         try validateDuplicateHeadings(allocator, page);
-        try validateInternalLinks(page, routes);
+        try validateInternalLinks(allocator, page, pages, routes);
     }
 }
 
@@ -709,6 +709,12 @@ fn failAt(path: []const u8, line: usize, column: usize, comptime fmt: []const u8
 
 fn validateDuplicateHeadings(allocator: std.mem.Allocator, page: Page) !void {
     var ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var keys = ids.keyIterator();
+        while (keys.next()) |id| allocator.free(id.*);
+        ids.deinit();
+    }
+
     var lines = std.mem.splitScalar(u8, page.markdown, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "#")) {
@@ -716,23 +722,163 @@ fn validateDuplicateHeadings(allocator: std.mem.Allocator, page: Page) !void {
             while (level < line.len and line[level] == '#') level += 1;
             const title = std.mem.trimStart(u8, line[level..], " ");
             const id = try slugify(allocator, title);
-            if (ids.contains(id)) return fail("duplicate heading id '{s}' in {s}", .{ id, page.source_path });
-            try ids.put(id, {});
+            if (ids.contains(id)) {
+                defer allocator.free(id);
+                return fail("duplicate heading id '{s}' in {s}", .{ id, page.source_path });
+            }
+            ids.put(id, {}) catch |err| {
+                allocator.free(id);
+                return err;
+            };
         }
     }
 }
 
-fn validateInternalLinks(page: Page, routes: RouteGraph) !void {
+const ResolvedLink = struct {
+    path: []const u8,
+    fragment: []const u8,
+
+    fn deinit(self: ResolvedLink, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+    }
+};
+
+fn validateInternalLinks(allocator: std.mem.Allocator, page: Page, pages: []Page, routes: RouteGraph) !void {
     var rest = page.markdown;
     while (std.mem.indexOf(u8, rest, "](")) |idx| {
         rest = rest[idx + 2 ..];
         const end = std.mem.indexOfScalar(u8, rest, ')') orelse break;
-        const url = rest[0..end];
-        if (std.mem.startsWith(u8, url, "/") and !std.mem.startsWith(u8, url, "//")) {
-            if (!routes.containsUrl(url)) return fail("broken internal link '{s}' in {s}", .{ url, page.source_path });
+        const destination = markdownLinkDestination(rest[0..end]);
+        if (try resolveInternalLink(allocator, page.url, destination)) |link| {
+            defer link.deinit(allocator);
+            const route = findRouteForLink(routes, link.path) orelse return fail("broken internal link '{s}' in {s}", .{ destination, page.source_path });
+            if (link.fragment.len > 0 and (route.kind == .page or route.kind == .post)) {
+                const target = findPageByUrl(pages, route.url) orelse return fail("broken internal link '{s}' in {s}", .{ destination, page.source_path });
+                if (!htmlHasId(target.html, link.fragment)) return fail("broken internal anchor '{s}' in {s}", .{ destination, page.source_path });
+            } else if (link.fragment.len > 0) {
+                return fail("broken internal anchor '{s}' in {s}", .{ destination, page.source_path });
+            }
         }
         rest = rest[end + 1 ..];
     }
+}
+
+fn markdownLinkDestination(raw: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return trimmed;
+    if (trimmed[0] == '<') {
+        if (std.mem.indexOfScalar(u8, trimmed, '>')) |end| return std.mem.trim(u8, trimmed[1..end], " \t\r\n");
+    }
+    var end: usize = 0;
+    while (end < trimmed.len and !std.ascii.isWhitespace(trimmed[end])) end += 1;
+    return trimmed[0..end];
+}
+
+fn resolveInternalLink(allocator: std.mem.Allocator, page_url: []const u8, destination: []const u8) !?ResolvedLink {
+    if (destination.len == 0 or std.mem.startsWith(u8, destination, "//") or hasUrlScheme(destination)) return null;
+
+    var without_fragment = destination;
+    var fragment: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, without_fragment, '#')) |idx| {
+        fragment = without_fragment[idx + 1 ..];
+        without_fragment = without_fragment[0..idx];
+    }
+    if (std.mem.indexOfScalar(u8, without_fragment, '?')) |idx| without_fragment = without_fragment[0..idx];
+
+    const path = if (without_fragment.len == 0)
+        try allocator.dupe(u8, page_url)
+    else if (std.mem.startsWith(u8, without_fragment, "/"))
+        try normalizeUrlPath(allocator, without_fragment)
+    else
+        try resolveRelativeUrlPath(allocator, page_url, without_fragment);
+
+    return .{ .path = path, .fragment = fragment };
+}
+
+fn hasUrlScheme(destination: []const u8) bool {
+    for (destination, 0..) |c, idx| {
+        switch (c) {
+            ':' => return idx > 0,
+            '/', '?', '#' => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn resolveRelativeUrlPath(allocator: std.mem.Allocator, page_url: []const u8, relative: []const u8) ![]const u8 {
+    const base = pageBaseUrl(page_url);
+    const joined = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, relative });
+    defer allocator.free(joined);
+    return normalizeUrlPath(allocator, joined);
+}
+
+fn pageBaseUrl(page_url: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, page_url, "/")) return page_url;
+    if (std.mem.lastIndexOfScalar(u8, page_url, '/')) |idx| return page_url[0 .. idx + 1];
+    return "/";
+}
+
+fn normalizeUrlPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var segments = std.array_list.Managed([]const u8).init(allocator);
+    defer segments.deinit();
+
+    const trailing_slash = path.len > 1 and std.mem.endsWith(u8, path, "/");
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) {
+            if (segments.items.len > 0) _ = segments.pop();
+            continue;
+        }
+        try segments.append(segment);
+    }
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    try out.append('/');
+    for (segments.items, 0..) |segment, idx| {
+        if (idx > 0) try out.append('/');
+        try out.appendSlice(segment);
+    }
+    if (trailing_slash and out.items.len > 1) try out.append('/');
+    return out.toOwnedSlice();
+}
+
+fn findRouteForLink(routes: RouteGraph, path: []const u8) ?Route {
+    for (routes.routes.items) |route| {
+        if (std.mem.eql(u8, route.url, path)) return route;
+        if (path.len > 1 and !std.mem.endsWith(u8, path, "/") and !urlPathHasExtension(path) and route.url.len == path.len + 1 and std.mem.startsWith(u8, route.url, path) and route.url[route.url.len - 1] == '/') return route;
+    }
+    return null;
+}
+
+fn findPageByUrl(pages: []Page, url: []const u8) ?Page {
+    for (pages) |page| {
+        if (std.mem.eql(u8, page.url, url)) return page;
+    }
+    return null;
+}
+
+fn urlPathHasExtension(path: []const u8) bool {
+    const start = if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| idx + 1 else 0;
+    return std.mem.indexOfScalar(u8, path[start..], '.') != null;
+}
+
+fn htmlHasId(html: []const u8, id: []const u8) bool {
+    return htmlHasQuotedId(html, id, "\"") or htmlHasQuotedId(html, id, "'");
+}
+
+fn htmlHasQuotedId(html: []const u8, id: []const u8, comptime quote: []const u8) bool {
+    const needle = " id=" ++ quote;
+    var rest = html;
+    while (std.mem.indexOf(u8, rest, needle)) |idx| {
+        const start = idx + needle.len;
+        const value = rest[start..];
+        const end = std.mem.indexOf(u8, value, quote) orelse return false;
+        if (std.mem.eql(u8, value[0..end], id)) return true;
+        rest = value[end + quote.len ..];
+    }
+    return false;
 }
 
 fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page) !RouteGraph {
@@ -1206,6 +1352,109 @@ test "route graph centralizes published routes and static assets" {
     try std.testing.expect(routes.containsUrl("/rss.xml"));
     try std.testing.expect(routes.containsUrl("/sitemap.xml"));
     try std.testing.expect(routes.containsUrl("/app.css"));
+}
+
+test "internal link validation resolves anchors route variants relative links and assets" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/static");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/app.css", .data = "body{}" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{
+            .source_path = "content/index.md",
+            .slug = "index",
+            .url = "/",
+            .fm = .{ .title = "Home" },
+            .markdown =
+            \\# Intro
+            \\
+            \\[Post](/post#details)
+            \\[Asset](/app.css)
+            ,
+            .html = "<h1 id=\"intro\">Intro</h1>",
+            .is_post = false,
+        },
+        .{
+            .source_path = "content/posts/post.md",
+            .slug = "post",
+            .url = "/post/",
+            .fm = .{ .title = "Post", .date = "2026-06-27", .tags = &[_][]const u8{"zig"} },
+            .markdown =
+            \\## Details
+            \\
+            \\[Home](../#intro)
+            \\[Self](/post)
+            \\[Tag](/tags/zig/)
+            \\[Feed](/rss.xml)
+            ,
+            .html = "<h2 id=\"details\">Details</h2>",
+            .is_post = true,
+        },
+    };
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    try validatePages(std.testing.allocator, pages[0..], routes);
+}
+
+test "internal link validation rejects unknown anchors" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{
+            .source_path = "content/index.md",
+            .slug = "index",
+            .url = "/",
+            .fm = .{ .title = "Home" },
+            .markdown =
+            \\# Intro
+            \\
+            \\[Missing](#missing)
+            ,
+            .html = "<h1 id=\"intro\">Intro</h1>",
+            .is_post = false,
+        },
+    };
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    try std.testing.expectError(error.InvalidSite, validatePages(std.testing.allocator, pages[0..], routes));
+}
+
+test "internal link validation rejects unknown relative routes" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{
+            .source_path = "content/posts/post.md",
+            .slug = "post",
+            .url = "/post/",
+            .fm = .{ .title = "Post", .date = "2026-06-27" },
+            .markdown =
+            \\# Post
+            \\
+            \\[Missing](../missing/)
+            ,
+            .html = "<h1 id=\"post\">Post</h1>",
+            .is_post = true,
+        },
+    };
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    try std.testing.expectError(error.InvalidSite, validatePages(std.testing.allocator, pages[0..], routes));
 }
 
 test "markdown renderer emits headings paragraphs and links" {
