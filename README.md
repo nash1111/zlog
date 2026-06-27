@@ -21,10 +21,12 @@ This MVP is currently verified with Zig 0.16.0.
 sudo apt-get install libcmark-gfm-dev libcmark-gfm-extensions-dev
 zig build test
 zig build
+zig build release-local
 ./zig-out/bin/zlog --help
 ```
 
 If Zig is not installed locally, install a recent Zig release first.
+Release artifact naming and packaging are documented in `docs/releases.md`.
 
 ## Usage
 
