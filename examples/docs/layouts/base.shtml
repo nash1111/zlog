@@ -1,0 +1,21 @@
+<!doctype html>
+<html z-attr:lang="site.language">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title z-text="page.full_title"></title>
+  <template z-replace="zlog.head"></template>
+</head>
+<body>
+  <header>
+    <a href="/" data-z-prefetch="hover" z-text="site.title"></a>
+    <nav><a href="/docs/getting-started/" data-z-prefetch="hover">Start</a></nav>
+  </header>
+  <main>
+    <template z-replace="content"></template>
+    <template z-replace="post_list"></template>
+    <template z-replace="pagination"></template>
+  </main>
+  <template z-replace="zlog.runtime"></template>
+</body>
+</html>

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Project preview</title>
+  <desc id="desc">A simple portfolio project preview image.</desc>
+  <rect width="1200" height="720" fill="#f4f7fb"/>
+  <rect x="96" y="96" width="1008" height="528" rx="18" fill="#ffffff" stroke="#203040" stroke-width="4"/>
+  <rect x="144" y="152" width="340" height="48" rx="8" fill="#203040"/>
+  <rect x="144" y="240" width="912" height="24" rx="4" fill="#8aa0b8"/>
+  <rect x="144" y="296" width="672" height="24" rx="4" fill="#8aa0b8"/>
+  <rect x="144" y="376" width="240" height="120" rx="10" fill="#f0b429"/>
+  <rect x="432" y="376" width="240" height="120" rx="10" fill="#2f9e6d"/>
+  <rect x="720" y="376" width="240" height="120" rx="10" fill="#4c6fff"/>
+</svg>

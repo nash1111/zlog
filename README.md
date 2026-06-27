@@ -223,9 +223,13 @@ Deploy the configured output directory, usually `public/`, to any static host.
 
 ## Examples
 
-The repository includes an example blog:
+The repository includes blog, docs, and portfolio examples:
 
 ```bash
 ./zig-out/bin/zlog check examples/blog
 ./zig-out/bin/zlog build examples/blog
+./zig-out/bin/zlog check examples/docs
+./zig-out/bin/zlog build examples/docs
+./zig-out/bin/zlog check examples/portfolio
+./zig-out/bin/zlog build examples/portfolio
 ```
