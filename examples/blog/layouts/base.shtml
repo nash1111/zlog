@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{page.title}} - {{site.title}}</title>
-  {{zlog.head}}
+  <title z-text="page.full_title"></title>
+  <template z-replace="zlog.head"></template>
 </head>
 <body>
-  <header><a href="/" data-z-prefetch="hover">{{site.title}}</a></header>
+  <header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header>
   <main>
-    {{content}}
-    {{post_list}}
+    <template z-replace="content"></template>
+    <template z-replace="post_list"></template>
   </main>
-  {{zlog.runtime}}
+  <template z-replace="zlog.runtime"></template>
 </body>
 </html>

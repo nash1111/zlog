@@ -976,18 +976,307 @@ fn copyStaticRoutes(allocator: std.mem.Allocator, routes: RouteGraph) !void {
     }
 }
 
+const TemplateContext = struct {
+    site: SiteConfig,
+    page: Page,
+    content: []const u8,
+    post_list: []const u8,
+    head: []const u8,
+    runtime: []const u8,
+    page_tags: []const u8,
+    page_full_title: []const u8,
+};
+
+const TemplateAction = enum { none, replace, text, html, attr_only };
+
+const ClosingTag = struct {
+    start: usize,
+    end: usize,
+};
+
 fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8) ![]const u8 {
-    var out = try replaceAll(allocator, layout, "{{site.title}}", site.title);
-    out = try replaceAll(allocator, out, "{{page.title}}", page.fm.title);
-    out = try replaceAll(allocator, out, "{{page.date}}", page.fm.date);
-    out = try replaceAll(allocator, out, "{{page.transition}}", page.fm.transition);
-    out = try replaceAll(allocator, out, "{{page.tags}}", try renderTagsInline(allocator, page.fm.tags));
-    out = try replaceAll(allocator, out, "{{content}}", content);
-    out = try replaceAll(allocator, out, "{{post_list}}", post_list);
-    out = try replaceAll(allocator, out, "{{zlog.head}}", head);
-    out = try replaceAll(allocator, out, "{{zlog.runtime}}", runtime);
-    out = try applyTransitionNames(allocator, out);
-    return out;
+    const page_tags = try renderTagsInline(allocator, page.fm.tags);
+    defer allocator.free(page_tags);
+    const page_full_title = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ page.fm.title, site.title });
+    defer allocator.free(page_full_title);
+    const rendered = try renderTemplate(allocator, layout, .{
+        .site = site,
+        .page = page,
+        .content = content,
+        .post_list = post_list,
+        .head = head,
+        .runtime = runtime,
+        .page_tags = page_tags,
+        .page_full_title = page_full_title,
+    });
+    defer allocator.free(rendered);
+    return applyTransitionNames(allocator, rendered);
+}
+
+fn renderTemplate(allocator: std.mem.Allocator, layout: []const u8, ctx: TemplateContext) ![]const u8 {
+    if (std.mem.indexOf(u8, layout, "{{") != null) {
+        try fail("legacy template token found; use z-text, z-html, z-replace, or z-attr:*", .{});
+        unreachable;
+    }
+    try validateTemplateStructure(allocator, layout);
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, layout, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, layout, lt, '>') orelse {
+            try fail("invalid template HTML structure", .{});
+            unreachable;
+        };
+        const tag = layout[lt .. gt + 1];
+        const name = startTagName(tag) orelse {
+            try out.appendSlice(layout[i .. gt + 1]);
+            i = gt + 1;
+            continue;
+        };
+        const action = templateAction(tag);
+        if (action == .none) {
+            try out.appendSlice(layout[i .. gt + 1]);
+            i = gt + 1;
+            continue;
+        }
+
+        try out.appendSlice(layout[i..lt]);
+        if (action == .replace) {
+            const expr = templateAttrValue(tag, "z-replace") orelse {
+                try fail("missing z-replace value on <{s}>", .{name});
+                unreachable;
+            };
+            const close = findClosingTag(layout, gt + 1, name) orelse {
+                try fail("missing closing tag for <{s}>", .{name});
+                unreachable;
+            };
+            try out.appendSlice(try templateValue(ctx, expr));
+            i = close.end;
+            continue;
+        }
+
+        const close = if (action == .text or action == .html)
+            findClosingTag(layout, gt + 1, name) orelse {
+                try fail("missing closing tag for <{s}>", .{name});
+                unreachable;
+            }
+        else
+            null;
+
+        const rendered_tag = try renderTemplateStartTag(allocator, tag, ctx);
+        defer allocator.free(rendered_tag);
+        try out.appendSlice(rendered_tag);
+
+        if (action == .text or action == .html) {
+            const expr = if (action == .text) templateAttrValue(tag, "z-text") orelse {
+                try fail("missing z-text value on <{s}>", .{name});
+                unreachable;
+            } else templateAttrValue(tag, "z-html") orelse {
+                try fail("missing z-html value on <{s}>", .{name});
+                unreachable;
+            };
+            const value = try templateValue(ctx, expr);
+            if (action == .text) {
+                try appendEscaped(&out, value);
+            } else {
+                try out.appendSlice(value);
+            }
+            try out.appendSlice(layout[close.?.start..close.?.end]);
+            i = close.?.end;
+        } else {
+            i = gt + 1;
+        }
+    }
+    try out.appendSlice(layout[i..]);
+    return out.toOwnedSlice();
+}
+
+fn templateAction(tag: []const u8) TemplateAction {
+    if (templateAttrValue(tag, "z-replace") != null) return .replace;
+    if (templateAttrValue(tag, "z-text") != null) return .text;
+    if (templateAttrValue(tag, "z-html") != null) return .html;
+    if (std.mem.indexOf(u8, tag, "z-attr:") != null) return .attr_only;
+    return .none;
+}
+
+fn templateValue(ctx: TemplateContext, expr: []const u8) ![]const u8 {
+    const name = std.mem.trim(u8, expr, " \t\r\n");
+    if (std.mem.eql(u8, name, "site.title")) return ctx.site.title;
+    if (std.mem.eql(u8, name, "page.title")) return ctx.page.fm.title;
+    if (std.mem.eql(u8, name, "page.full_title")) return ctx.page_full_title;
+    if (std.mem.eql(u8, name, "page.date")) return ctx.page.fm.date;
+    if (std.mem.eql(u8, name, "page.transition")) return ctx.page.fm.transition;
+    if (std.mem.eql(u8, name, "page.tags")) return ctx.page_tags;
+    if (std.mem.eql(u8, name, "content")) return ctx.content;
+    if (std.mem.eql(u8, name, "post_list")) return ctx.post_list;
+    if (std.mem.eql(u8, name, "zlog.head")) return ctx.head;
+    if (std.mem.eql(u8, name, "zlog.runtime")) return ctx.runtime;
+    try fail("unknown template binding '{s}'", .{name});
+    unreachable;
+}
+
+fn renderTemplateStartTag(allocator: std.mem.Allocator, tag: []const u8, ctx: TemplateContext) ![]const u8 {
+    const name = startTagName(tag) orelse return allocator.dupe(u8, tag);
+    var out = std.array_list.Managed(u8).init(allocator);
+    try out.append('<');
+    try out.appendSlice(name);
+
+    var i: usize = 1 + name.len;
+    while (i < tag.len and tag[i] != '>' and tag[i] != '/') {
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i >= tag.len or tag[i] == '>' or tag[i] == '/') break;
+        const attr_start = i;
+        while (i < tag.len and tag[i] != '=' and tag[i] != '>' and tag[i] != '/' and !std.ascii.isWhitespace(tag[i])) i += 1;
+        const attr_name = tag[attr_start..i];
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i < tag.len and tag[i] == '=') {
+            i += 1;
+            while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+            if (i < tag.len and (tag[i] == '"' or tag[i] == '\'')) {
+                const quote = tag[i];
+                i += 1;
+                while (i < tag.len and tag[i] != quote) i += 1;
+                if (i < tag.len) i += 1;
+            } else {
+                while (i < tag.len and tag[i] != '>' and tag[i] != '/' and !std.ascii.isWhitespace(tag[i])) i += 1;
+            }
+        }
+        const attr = tag[attr_start..i];
+        if (std.mem.eql(u8, attr_name, "z-text") or std.mem.eql(u8, attr_name, "z-html") or std.mem.eql(u8, attr_name, "z-replace")) continue;
+        if (std.mem.startsWith(u8, attr_name, "z-attr:")) {
+            const value = templateAttrValue(tag, attr_name) orelse "";
+            const rendered = try templateValue(ctx, value);
+            if (rendered.len == 0) continue;
+            try out.append(' ');
+            try out.appendSlice(attr_name["z-attr:".len..]);
+            try out.appendSlice("=\"");
+            try appendEscaped(&out, rendered);
+            try out.append('"');
+            continue;
+        }
+        try out.append(' ');
+        try out.appendSlice(attr);
+    }
+
+    if (isSelfClosingTag(tag)) {
+        try out.appendSlice(" />");
+    } else {
+        try out.append('>');
+    }
+    return out.toOwnedSlice();
+}
+
+fn templateAttrValue(tag: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 1;
+    while (i < tag.len and tag[i] != '>' and tag[i] != '/') {
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        const attr_start = i;
+        while (i < tag.len and tag[i] != '=' and tag[i] != '>' and tag[i] != '/' and !std.ascii.isWhitespace(tag[i])) i += 1;
+        const attr_name = tag[attr_start..i];
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i >= tag.len or tag[i] != '=') continue;
+        i += 1;
+        while (i < tag.len and std.ascii.isWhitespace(tag[i])) i += 1;
+        if (i >= tag.len) return null;
+        const value: []const u8 = if (tag[i] == '"' or tag[i] == '\'') value: {
+            const quote = tag[i];
+            i += 1;
+            const value_start = i;
+            while (i < tag.len and tag[i] != quote) i += 1;
+            const value_end = i;
+            if (i < tag.len) i += 1;
+            break :value tag[value_start..value_end];
+        } else value: {
+            const value_start = i;
+            while (i < tag.len and tag[i] != '>' and tag[i] != '/' and !std.ascii.isWhitespace(tag[i])) i += 1;
+            break :value tag[value_start..i];
+        };
+        if (std.mem.eql(u8, attr_name, name)) return value;
+    }
+    return null;
+}
+
+fn validateTemplateStructure(allocator: std.mem.Allocator, html: []const u8) !void {
+    var stack = std.array_list.Managed([]const u8).init(allocator);
+    defer stack.deinit();
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
+            const end = std.mem.indexOf(u8, html[lt + 4 ..], "-->") orelse return fail("invalid template HTML comment", .{});
+            i = lt + 4 + end + 3;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return fail("invalid template HTML structure", .{});
+        const tag = html[lt .. gt + 1];
+        if (tag.len >= 2 and (tag[1] == '!' or tag[1] == '?')) {
+            i = gt + 1;
+            continue;
+        }
+        if (closingTagName(tag)) |name| {
+            if (stack.items.len == 0) return fail("unexpected closing tag </{s}>", .{name});
+            const open = stack.items[stack.items.len - 1];
+            if (!std.ascii.eqlIgnoreCase(open, name)) return fail("closing tag </{s}> does not match <{s}>", .{ name, open });
+            _ = stack.pop();
+        } else if (startTagName(tag)) |name| {
+            if (!isSelfClosingTag(tag) and !isVoidHtmlTag(name)) try stack.append(name);
+        }
+        i = gt + 1;
+    }
+    if (stack.items.len > 0) return fail("unclosed template tag <{s}>", .{stack.items[stack.items.len - 1]});
+}
+
+fn startTagName(tag: []const u8) ?[]const u8 {
+    if (tag.len < 3 or tag[0] != '<' or tag[1] == '/' or tag[1] == '!' or tag[1] == '?') return null;
+    var end: usize = 1;
+    while (end < tag.len and tag[end] != '>' and tag[end] != '/' and !std.ascii.isWhitespace(tag[end])) end += 1;
+    if (end == 1) return null;
+    return tag[1..end];
+}
+
+fn closingTagName(tag: []const u8) ?[]const u8 {
+    if (tag.len < 4 or !std.mem.startsWith(u8, tag, "</")) return null;
+    var end: usize = 2;
+    while (end < tag.len and tag[end] != '>' and !std.ascii.isWhitespace(tag[end])) end += 1;
+    if (end == 2) return null;
+    return tag[2..end];
+}
+
+fn isSelfClosingTag(tag: []const u8) bool {
+    var i = tag.len;
+    while (i > 0 and (tag[i - 1] == '>' or std.ascii.isWhitespace(tag[i - 1]))) i -= 1;
+    return i > 0 and tag[i - 1] == '/';
+}
+
+fn isVoidHtmlTag(name: []const u8) bool {
+    const names = [_][]const u8{ "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr" };
+    for (names) |void_name| {
+        if (std.ascii.eqlIgnoreCase(name, void_name)) return true;
+    }
+    return false;
+}
+
+fn findClosingTag(html: []const u8, start: usize, name: []const u8) ?ClosingTag {
+    var i = start;
+    var depth: usize = 1;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        if (std.mem.startsWith(u8, html[lt..], "<!--")) {
+            const end = std.mem.indexOf(u8, html[lt + 4 ..], "-->") orelse return null;
+            i = lt + 4 + end + 3;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return null;
+        const tag = html[lt .. gt + 1];
+        if (closingTagName(tag)) |close_name| {
+            if (std.ascii.eqlIgnoreCase(close_name, name)) {
+                depth -= 1;
+                if (depth == 0) return .{ .start = lt, .end = gt + 1 };
+            }
+        } else if (startTagName(tag)) |open_name| {
+            if (std.ascii.eqlIgnoreCase(open_name, name) and !isSelfClosingTag(tag) and !isVoidHtmlTag(open_name)) depth += 1;
+        }
+        i = gt + 1;
+    }
+    return null;
 }
 
 fn renderPostList(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
@@ -1007,7 +1296,9 @@ fn renderTagsInline(allocator: std.mem.Allocator, tags: []const []const u8) ![]c
     var out = std.array_list.Managed(u8).init(allocator);
     for (tags, 0..) |tag, i| {
         if (i > 0) try out.appendSlice(" ");
-        try out.print("<a href=\"/tags/{s}/\" data-z-prefetch=\"hover\">#{s}</a>", .{ try slugify(allocator, tag), tag });
+        const slug = try slugify(allocator, tag);
+        defer allocator.free(slug);
+        try out.print("<a href=\"/tags/{s}/\" data-z-prefetch=\"hover\">#{s}</a>", .{ slug, tag });
     }
     return out.toOwnedSlice();
 }
@@ -1043,6 +1334,7 @@ fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const
         rest = rest[idx + " z-transition-name=\"".len ..];
         const end = std.mem.indexOfScalar(u8, rest, '"') orelse break;
         const name = try safeCssIdent(allocator, rest[0..end]);
+        defer allocator.free(name);
         try out.print(" style=\"view-transition-name:{s}\"", .{name});
         rest = rest[end + 1 ..];
     }
@@ -1256,13 +1548,13 @@ const initPost =
 ;
 const initBaseLayout =
     \\<!doctype html>
-    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{page.title}} - {{site.title}}</title>{{zlog.head}}</head>
-    \\<body><header><a href="/" data-z-prefetch="hover">{{site.title}}</a></header><main>{{content}}{{post_list}}</main>{{zlog.runtime}}</body></html>
+    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
+    \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><main><template z-replace="content"></template><template z-replace="post_list"></template></main><template z-replace="zlog.runtime"></template></body></html>
 ;
 const initPostLayout =
     \\<!doctype html>
-    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{page.title}} - {{site.title}}</title>{{zlog.head}}</head>
-    \\<body><header><a href="/" data-z-prefetch="hover">{{site.title}}</a></header><article><h1 z-transition-name="{{page.transition}}">{{page.title}}</h1><p><time>{{page.date}}</time> {{page.tags}}</p>{{content}}</article>{{zlog.runtime}}</body></html>
+    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
+    \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><article><h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1><p><time z-text="page.date"></time> <span z-replace="page.tags"></span></p><template z-replace="content"></template></article><template z-replace="zlog.runtime"></template></body></html>
 ;
 
 test "frontmatter parser reads title tags and draft" {
@@ -1455,6 +1747,42 @@ test "internal link validation rejects unknown relative routes" {
     var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
     defer routes.deinit();
     try std.testing.expectError(error.InvalidSite, validatePages(std.testing.allocator, pages[0..], routes));
+}
+
+test "template renderer applies attributes and raw slots" {
+    const page = Page{
+        .source_path = "content/posts/post.md",
+        .slug = "post",
+        .url = "/post/",
+        .fm = .{ .title = "A & B", .date = "2026-06-27", .tags = &[_][]const u8{"zig"}, .transition = "post title" },
+        .markdown = "",
+        .html = "",
+        .is_post = true,
+    };
+    const html = try renderLayout(std.testing.allocator, initPostLayout, .{ .title = "Example" }, page, "<p>Body</p>", "", "", "");
+    defer std.testing.allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "<title>A &amp; B - Example</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<h1 style=\"view-transition-name:post-title\">A &amp; B</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<p>Body</p>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "z-text") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "z-replace") == null);
+}
+
+test "template renderer rejects invalid structure and legacy tokens" {
+    const page = Page{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false };
+    const ctx = TemplateContext{
+        .site = .{},
+        .page = page,
+        .content = "",
+        .post_list = "",
+        .head = "",
+        .runtime = "",
+        .page_tags = "",
+        .page_full_title = "Home - zlog site",
+    };
+    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main><p></main>", ctx));
+    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main>{{content}}</main>", ctx));
 }
 
 test "markdown renderer emits headings paragraphs and links" {
