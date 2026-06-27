@@ -3,6 +3,7 @@
 .language = "en",
 .timezone = "+09:00",
 .author = "Example Author",
+.permalink = "/posts/:year/:month/:slug/",
 .content_dir = "content",
 .layouts_dir = "layouts",
 .out_dir = "public",

@@ -48,9 +48,11 @@ Site-wide metadata lives in `zlog.ziggy`:
 .language = "en",
 .timezone = "UTC",
 .author = "Example Author",
+.permalink = "/posts/:year/:month/:slug/",
 ```
 
 RSS and sitemap output use `.url` for absolute URLs. RSS, generated metadata, and templates can also consume `.language`, `.timezone`, and `.author`.
+Post URLs use `.permalink`; supported placeholders are `:slug`, `:year`, `:month`, and `:day`.
 
 `zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
@@ -61,6 +63,7 @@ Ziggy-like frontmatter is supported for the MVP:
 ```md
 ---
 .title = "Hello zlog",
+.slug = "hello-zlog",
 .date = "2026-06-23T00:00:00+09:00",
 .updated = "2026-06-24T00:00:00+09:00",
 .tags = ["zig", "ssg"],
