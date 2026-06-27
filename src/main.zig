@@ -611,6 +611,7 @@ fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site
     const sized_html = try applyImageDimensions(allocator, final_html, page.url, assets);
     errdefer allocator.free(sized_html);
     try validateHtmlDocument(allocator, sized_html, output_path);
+    try validateTransitionNames(allocator, sized_html, output_path);
     return sized_html;
 }
 
@@ -2541,6 +2542,89 @@ fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const
     return out.toOwnedSlice();
 }
 
+const TransitionNameUse = struct {
+    line: usize,
+    column: usize,
+    tag_name: []const u8,
+};
+
+fn validateTransitionNames(allocator: std.mem.Allocator, html: []const u8, path: []const u8) !void {
+    var seen = std.StringHashMap(TransitionNameUse).init(allocator);
+    defer seen.deinit();
+
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse break;
+        const tag = html[lt .. gt + 1];
+        const tag_name = startTagName(tag) orelse {
+            i = gt + 1;
+            continue;
+        };
+        const loc = sourceLocationAt(html, lt);
+        if (templateAttrValue(tag, "style")) |style| {
+            try validateStyleTransitionNames(&seen, style, path, loc, tag_name);
+        }
+        if (isRawTextHtmlTag(tag_name)) {
+            if (findClosingTag(html, gt + 1, tag_name)) |close| {
+                i = close.end;
+                continue;
+            }
+        }
+        i = gt + 1;
+    }
+}
+
+fn validateStyleTransitionNames(seen: *std.StringHashMap(TransitionNameUse), style: []const u8, path: []const u8, loc: SourceLocation, tag_name: []const u8) !void {
+    var offset: usize = 0;
+    while (nextViewTransitionName(style, &offset)) |name| {
+        if (seen.get(name)) |first| {
+            return failAtHint(path, loc.line, loc.column, "duplicate view-transition-name '{s}' on <{s}>; first used on <{s}> at {d}:{d}", .{ name, tag_name, first.tag_name, first.line, first.column }, "Use unique .transition values or z-transition-name attributes within each rendered page.");
+        }
+        try seen.put(name, .{ .line = loc.line, .column = loc.column, .tag_name = tag_name });
+    }
+}
+
+fn nextViewTransitionName(style: []const u8, offset: *usize) ?[]const u8 {
+    const property = "view-transition-name";
+    while (indexOfIgnoreCasePos(style, offset.*, property)) |idx| {
+        offset.* = idx + property.len;
+        if (idx > 0 and style[idx - 1] != ';' and !std.ascii.isWhitespace(style[idx - 1])) continue;
+        var i = idx + property.len;
+        while (i < style.len and std.ascii.isWhitespace(style[i])) i += 1;
+        if (i >= style.len or style[i] != ':') continue;
+        i += 1;
+        while (i < style.len and std.ascii.isWhitespace(style[i])) i += 1;
+        const start = i;
+        while (i < style.len and style[i] != ';' and style[i] != '!' and !std.ascii.isWhitespace(style[i])) i += 1;
+        offset.* = i;
+        const name = std.mem.trim(u8, style[start..i], " \t\r\n");
+        if (name.len == 0 or ignoredTransitionName(name)) continue;
+        return name;
+    }
+    return null;
+}
+
+fn indexOfIgnoreCasePos(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return start;
+    if (start >= haystack.len or needle.len > haystack.len) return null;
+    var i = start;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+fn ignoredTransitionName(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "none") or
+        std.ascii.eqlIgnoreCase(name, "auto") or
+        std.ascii.eqlIgnoreCase(name, "match-element") or
+        std.ascii.eqlIgnoreCase(name, "inherit") or
+        std.ascii.eqlIgnoreCase(name, "initial") or
+        std.ascii.eqlIgnoreCase(name, "unset") or
+        std.ascii.eqlIgnoreCase(name, "revert") or
+        std.ascii.eqlIgnoreCase(name, "revert-layer");
+}
+
 fn renderIndexPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     const total = paginationPageCount(countPublishedPosts(pages), site.page_size);
     if (total <= 1) return;
@@ -2559,6 +2643,7 @@ fn renderIndexPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []P
         const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
         defer allocator.free(rendered);
         try validateHtmlDocument(allocator, rendered, route.out_path);
+        try validateTransitionNames(allocator, rendered, route.out_path);
         try writeAll(allocator, route.out_path, rendered);
     }
 }
@@ -2608,6 +2693,7 @@ fn renderTaxonomyPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: 
                     const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, owned_content, post_list, head, runtime, pagination.context);
                     defer allocator.free(rendered);
                     try validateHtmlDocument(allocator, rendered, route.out_path);
+                    try validateTransitionNames(allocator, rendered, route.out_path);
                     try writeAll(allocator, route.out_path, rendered);
                 }
             }
@@ -2633,6 +2719,7 @@ fn renderArchivePage(allocator: std.mem.Allocator, routes: RouteGraph, pages: []
         const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
         defer allocator.free(rendered);
         try validateHtmlDocument(allocator, rendered, route.out_path);
+        try validateTransitionNames(allocator, rendered, route.out_path);
         try writeAll(allocator, route.out_path, rendered);
     }
 }
@@ -3769,6 +3856,47 @@ test "template renderer applies attributes and raw slots" {
     try std.testing.expect(std.mem.indexOf(u8, html, "<p>Body</p>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "z-text") == null);
     try std.testing.expect(std.mem.indexOf(u8, html, "z-replace") == null);
+}
+
+test "transition name validation rejects duplicates within one page" {
+    try validateTransitionNames(std.testing.allocator,
+        \\<main>
+        \\<h1 style="view-transition-name:post-title">Title</h1>
+        \\<p style="View-Transition-Name:summary">Summary</p>
+        \\<aside style="view-transition-name:NONE">Aside</aside>
+        \\</main>
+    , "public/index.html");
+
+    try std.testing.expectError(error.InvalidSite, validateTransitionNames(std.testing.allocator,
+        \\<main>
+        \\<h1 style="view-transition-name:post-title">Title</h1>
+        \\<p style="color:red; View-Transition-Name:post-title">Summary</p>
+        \\</main>
+    , "public/index.html"));
+}
+
+test "page output rejects duplicate generated transition names" {
+    var assets = AssetGraph.init(std.testing.allocator);
+    defer assets.deinit();
+    const page = Page{
+        .source_path = "content/posts/post.md",
+        .slug = "post",
+        .url = "/post/",
+        .fm = .{ .title = "Post", .date = "2026-06-27", .transition = "post title" },
+        .markdown = "",
+        .html = "",
+        .is_post = true,
+    };
+    const layout = LayoutSource{
+        .path = "<test layout>",
+        .html =
+        \\<html><head><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head><body>
+        \\<h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1>
+        \\<main><template z-replace="content"></template></main>
+        \\</body></html>
+        ,
+    };
+    try std.testing.expectError(error.InvalidSite, renderPageOutputHtml(std.testing.allocator, layout, .{}, page, "<p style=\"view-transition-name:post-title\">Body</p>", "", "", "", "public/post/index.html", assets, .{}));
 }
 
 test "template renderer rejects invalid structure and legacy tokens" {
