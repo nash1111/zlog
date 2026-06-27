@@ -8,6 +8,7 @@ const SiteConfig = struct {
     timezone: []const u8 = "UTC",
     author: []const u8 = "",
     permalink: []const u8 = "/:slug/",
+    page_size: usize = 10,
     content_dir: []const u8 = "content",
     layouts_dir: []const u8 = "layouts",
     out_dir: []const u8 = "public",
@@ -81,7 +82,7 @@ const Page = struct {
     is_post: bool,
 };
 
-const RouteKind = enum { page, post, tag, archive, rss, sitemap, static_asset };
+const RouteKind = enum { page, post, index_page, tag, tag_page, archive, archive_page, rss, sitemap, static_asset };
 
 const Route = struct {
     kind: RouteKind,
@@ -309,10 +310,13 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
-        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets);
+        const pagination = if (std.mem.eql(u8, page.url, "/")) try makePaginationContext(allocator, "/", 1, paginationPageCount(countPublishedPosts(pages.items), site.page_size)) else OwnedPaginationContext{};
+        defer pagination.deinit(allocator);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets, pagination.context);
         try writeAll(allocator, route.out_path, final_html);
     }
 
+    try renderIndexPages(allocator, routes, pages.items, site, head, runtime);
     try renderTagPages(allocator, routes, pages.items, site, head, runtime);
     try renderArchivePage(allocator, routes, pages.items, site, head, runtime);
     const rss_route = routes.firstByKind(.rss) orelse return fail("missing RSS route", .{});
@@ -572,16 +576,18 @@ fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: Sit
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
-        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets);
+        const pagination = if (std.mem.eql(u8, page.url, "/")) try makePaginationContext(allocator, "/", 1, paginationPageCount(countPublishedPosts(pages), site.page_size)) else OwnedPaginationContext{};
+        defer pagination.deinit(allocator);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets, pagination.context);
         allocator.free(final_html);
     }
 
     try validateGeneratedListingHtml(allocator, routes, pages, site, head, runtime);
 }
 
-fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8, assets: AssetGraph) ![]const u8 {
+fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8, assets: AssetGraph, pagination: PaginationContext) ![]const u8 {
     try validateHtmlDocument(allocator, layout.html, layout.path);
-    const rendered = try renderLayout(allocator, layout.html, layout.path, site, page, content, post_list, head, runtime);
+    const rendered = try renderLayout(allocator, layout.html, layout.path, site, page, content, post_list, head, runtime, pagination);
     defer allocator.free(rendered);
     const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
     defer allocator.free(final_html);
@@ -592,6 +598,24 @@ fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site
 }
 
 fn validateGeneratedListingHtml(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+    const index_total = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    var index_page: usize = 2;
+    while (index_page <= index_total) : (index_page += 1) {
+        const page_url = try listingPageUrl(allocator, "/", index_page);
+        defer allocator.free(page_url);
+        const route = findRoute(routes, .index_page, page_url) orelse return fail("missing index pagination route for {s}", .{page_url});
+        const content = try std.fmt.allocPrint(allocator, "<h1>Posts</h1>\n", .{});
+        defer allocator.free(content);
+        const post_list = try renderPostListPage(allocator, pages, site, index_page, null);
+        defer allocator.free(post_list);
+        const pagination = try makePaginationContext(allocator, "/", index_page, index_total);
+        defer pagination.deinit(allocator);
+        const fake = Page{ .source_path = "", .slug = "posts", .url = page_url, .fm = .{ .title = "Posts", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+        const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+        defer allocator.free(rendered);
+        try validateHtmlDocument(allocator, rendered, route.out_path);
+    }
+
     var seen = std.StringHashMap(void).init(allocator);
     defer {
         var keys = seen.keyIterator();
@@ -613,17 +637,45 @@ fn validateGeneratedListingHtml(allocator: std.mem.Allocator, routes: RouteGraph
             };
             const tag_url = try std.fmt.allocPrint(allocator, "/tags/{s}/", .{tag_slug});
             defer allocator.free(tag_url);
-            const route = findRoute(routes, .tag, tag_url) orelse return fail("missing tag route for {s}", .{tag_url});
-            const rendered = try renderTagPageHtml(allocator, tag, tag_slug, pages, site, head, runtime);
-            defer allocator.free(rendered);
-            try validateHtmlDocument(allocator, rendered, route.out_path);
+            const total = paginationPageCount(countPublishedPostsWithTag(pages, tag), site.page_size);
+            var page_number: usize = 1;
+            while (page_number <= total) : (page_number += 1) {
+                const page_url = try listingPageUrl(allocator, tag_url, page_number);
+                defer allocator.free(page_url);
+                const route_kind: RouteKind = if (page_number == 1) .tag else .tag_page;
+                const route = findRoute(routes, route_kind, page_url) orelse return fail("missing tag route for {s}", .{page_url});
+                const content = try std.fmt.allocPrint(allocator, "<h1>#{s}</h1>\n", .{tag});
+                defer allocator.free(content);
+                const post_list = try renderPostListPage(allocator, pages, site, page_number, tag);
+                defer allocator.free(post_list);
+                const pagination = try makePaginationContext(allocator, tag_url, page_number, total);
+                defer pagination.deinit(allocator);
+                const fake = Page{ .source_path = "", .slug = tag_slug, .url = page_url, .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+                const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+                defer allocator.free(rendered);
+                try validateHtmlDocument(allocator, rendered, route.out_path);
+            }
         }
     }
 
-    const archive_route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
-    const archive = try renderArchivePageHtml(allocator, pages, site, head, runtime);
-    defer allocator.free(archive);
-    try validateHtmlDocument(allocator, archive, archive_route.out_path);
+    const archive_total = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    var archive_page: usize = 1;
+    while (archive_page <= archive_total) : (archive_page += 1) {
+        const page_url = try listingPageUrl(allocator, "/archive/", archive_page);
+        defer allocator.free(page_url);
+        const route_kind: RouteKind = if (archive_page == 1) .archive else .archive_page;
+        const route = findRoute(routes, route_kind, page_url) orelse return fail("missing archive route for {s}", .{page_url});
+        const content = try std.fmt.allocPrint(allocator, "<h1>Archive</h1>\n", .{});
+        defer allocator.free(content);
+        const post_list = try renderArchiveListPage(allocator, pages, site, archive_page);
+        defer allocator.free(post_list);
+        const pagination = try makePaginationContext(allocator, "/archive/", archive_page, archive_total);
+        defer pagination.deinit(allocator);
+        const fake = Page{ .source_path = "", .slug = "archive", .url = page_url, .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+        const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+        defer allocator.free(rendered);
+        try validateHtmlDocument(allocator, rendered, route.out_path);
+    }
 }
 
 fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
@@ -641,6 +693,7 @@ fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
         .timezone = try ziggyString(doc, path, "timezone", "UTC"),
         .author = try ziggyString(doc, path, "author", ""),
         .permalink = try ziggyString(doc, path, "permalink", "/:slug/"),
+        .page_size = try ziggyUsize(doc, path, "page_size", 10),
         .content_dir = try ziggyString(doc, path, "content_dir", "content"),
         .layouts_dir = try ziggyString(doc, path, "layouts_dir", "layouts"),
         .out_dir = try ziggyString(doc, path, "out_dir", "public"),
@@ -657,6 +710,7 @@ fn validateSiteConfig(site: SiteConfig, path: []const u8) !void {
     if (!validTimezone(site.timezone)) return failAtHint(path, 1, 1, "invalid timezone '{s}'", .{site.timezone}, "Use UTC, an offset such as +09:00, or an IANA-style name such as Asia/Tokyo.");
     if (!validAuthor(site.author)) return failAtHint(path, 1, 1, "invalid author value", .{}, "Keep .author to a single line without control characters.");
     if (!validPermalinkPattern(site.permalink)) return failAtHint(path, 1, 1, "invalid permalink pattern '{s}'", .{site.permalink}, "Use a pattern such as /:slug/ or /posts/:year/:month/:slug/.");
+    if (site.page_size == 0 or site.page_size > 1000) return failAtHint(path, 1, 1, "invalid page size {d}", .{site.page_size}, "Set .page_size to a value between 1 and 1000.");
 }
 
 fn validSiteUrl(url: []const u8) bool {
@@ -842,6 +896,7 @@ fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []cons
 const ZiggyValue = union(enum) {
     string: []const u8,
     bool: bool,
+    integer: i64,
     string_array: []const []const u8,
     object,
 };
@@ -969,6 +1024,7 @@ const ZiggyParser = struct {
             '"' => .{ .string = try self.parseString() },
             '[' => .{ .string_array = try self.parseStringArray() },
             't', 'f' => .{ .bool = try self.parseBool() },
+            '0'...'9' => .{ .integer = try self.parseInteger() },
             '.' => blk: {
                 _ = self.advance();
                 try self.expect('{');
@@ -983,7 +1039,7 @@ const ZiggyParser = struct {
                 }
                 break :blk .object;
             },
-            else => self.failHint("unsupported Ziggy value", .{}, "Use a string, bool, string array, or .{ ... } object value."),
+            else => self.failHint("unsupported Ziggy value", .{}, "Use a string, integer, bool, string array, or .{ ... } object value."),
         };
     }
 
@@ -1035,6 +1091,14 @@ const ZiggyParser = struct {
         }
         return self.failHint("expected bool", .{}, "Use true or false without quotes.");
     }
+
+    fn parseInteger(self: *ZiggyParser) anyerror!i64 {
+        const start = self.index;
+        while (!self.isDone() and std.ascii.isDigit(self.peek())) _ = self.advance();
+        return std.fmt.parseInt(i64, self.text[start..self.index], 10) catch {
+            return self.failHint("invalid integer", .{}, "Use a base-10 integer such as 10.");
+        };
+    }
 };
 
 fn ziggyString(doc: ZiggyDoc, path: []const u8, name: []const u8, default: []const u8) ![]const u8 {
@@ -1071,6 +1135,20 @@ fn ziggyBool(doc: ZiggyDoc, path: []const u8, name: []const u8, default: bool) !
         .bool => |value| value,
         else => {
             try failAtHint(path, field.line, field.column, ".{s} must be a bool", .{name}, "Use true or false without quotes.");
+            unreachable;
+        },
+    };
+}
+
+fn ziggyUsize(doc: ZiggyDoc, path: []const u8, name: []const u8, default: usize) !usize {
+    const field = doc.find(name) orelse return default;
+    return switch (field.value) {
+        .integer => |value| if (value > 0) @intCast(value) else {
+            try failAtHint(path, field.line, field.column, ".{s} must be positive", .{name}, "Use an integer greater than zero.");
+            unreachable;
+        },
+        else => {
+            try failAtHint(path, field.line, field.column, ".{s} must be an integer", .{name}, "Use an unquoted integer value.");
             unreachable;
         },
     };
@@ -1432,6 +1510,16 @@ fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConf
         });
     }
 
+    const index_page_count = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    var index_page: usize = 2;
+    while (index_page <= index_page_count) : (index_page += 1) {
+        try graph.add(.{
+            .kind = .index_page,
+            .url = try graph.own(try std.fmt.allocPrint(allocator, "/page/{d}/", .{index_page})),
+            .out_path = try graph.own(try join(allocator, &.{ out_dir, "page", try graph.own(try std.fmt.allocPrint(allocator, "{d}", .{index_page})), "index.html" })),
+        });
+    }
+
     var seen_tags = std.StringHashMap(void).init(allocator);
     defer seen_tags.deinit();
     for (pages) |page| {
@@ -1452,10 +1540,30 @@ fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConf
                 .url = try graph.own(try std.fmt.allocPrint(allocator, "/tags/{s}/", .{owned_slug})),
                 .out_path = try graph.own(try join(allocator, &.{ out_dir, "tags", owned_slug, "index.html" })),
             });
+            const tag_page_count = paginationPageCount(countPublishedPostsWithTag(pages, tag), site.page_size);
+            var tag_page: usize = 2;
+            while (tag_page <= tag_page_count) : (tag_page += 1) {
+                const tag_page_name = try graph.own(try std.fmt.allocPrint(allocator, "{d}", .{tag_page}));
+                try graph.add(.{
+                    .kind = .tag_page,
+                    .url = try graph.own(try std.fmt.allocPrint(allocator, "/tags/{s}/page/{d}/", .{ owned_slug, tag_page })),
+                    .out_path = try graph.own(try join(allocator, &.{ out_dir, "tags", owned_slug, "page", tag_page_name, "index.html" })),
+                });
+            }
         }
     }
 
     try graph.add(.{ .kind = .archive, .url = "/archive/", .out_path = try graph.own(try join(allocator, &.{ out_dir, "archive", "index.html" })) });
+    const archive_page_count = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    var archive_page: usize = 2;
+    while (archive_page <= archive_page_count) : (archive_page += 1) {
+        const archive_page_name = try graph.own(try std.fmt.allocPrint(allocator, "{d}", .{archive_page}));
+        try graph.add(.{
+            .kind = .archive_page,
+            .url = try graph.own(try std.fmt.allocPrint(allocator, "/archive/page/{d}/", .{archive_page})),
+            .out_path = try graph.own(try join(allocator, &.{ out_dir, "archive", "page", archive_page_name, "index.html" })),
+        });
+    }
     try graph.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "rss.xml" })) });
     try graph.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "sitemap.xml" })) });
 
@@ -1504,7 +1612,7 @@ fn buildAssetGraph(allocator: std.mem.Allocator, pages: []Page, routes: RouteGra
     for (routes.routes.items) |route| {
         switch (route.kind) {
             .static_asset => try addRouteAsset(allocator, &graph, .site_asset, "", route),
-            .page, .post, .tag, .archive, .rss, .sitemap => try addRouteAsset(allocator, &graph, .build_asset, routeOwnerPath(pages, route), route),
+            .page, .post, .index_page, .tag, .tag_page, .archive, .archive_page, .rss, .sitemap => try addRouteAsset(allocator, &graph, .build_asset, routeOwnerPath(pages, route), route),
         }
     }
 
@@ -1697,6 +1805,29 @@ const TemplateContext = struct {
     runtime: []const u8,
     page_tags: []const u8,
     page_full_title: []const u8,
+    pagination_nav: []const u8,
+    pagination_current: []const u8,
+    pagination_total: []const u8,
+    pagination_previous_url: []const u8,
+    pagination_next_url: []const u8,
+};
+
+const PaginationContext = struct {
+    current: usize = 1,
+    total: usize = 1,
+    previous_url: []const u8 = "",
+    next_url: []const u8 = "",
+};
+
+const OwnedPaginationContext = struct {
+    context: PaginationContext = .{},
+    previous_url: []const u8 = "",
+    next_url: []const u8 = "",
+
+    fn deinit(self: OwnedPaginationContext, allocator: std.mem.Allocator) void {
+        if (self.previous_url.len > 0) allocator.free(self.previous_url);
+        if (self.next_url.len > 0) allocator.free(self.next_url);
+    }
 };
 
 const TemplateAction = enum { none, replace, text, html, attr_only };
@@ -1717,11 +1848,17 @@ const SourceLocation = struct {
     column: usize,
 };
 
-fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8) ![]const u8 {
+fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, pagination: PaginationContext) ![]const u8 {
     const page_tags = try renderTagsInline(allocator, page.fm.tags);
     defer allocator.free(page_tags);
     const page_full_title = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ page.fm.title, site.title });
     defer allocator.free(page_full_title);
+    const pagination_nav = try renderPaginationNav(allocator, pagination);
+    defer allocator.free(pagination_nav);
+    const pagination_current = try std.fmt.allocPrint(allocator, "{d}", .{pagination.current});
+    defer allocator.free(pagination_current);
+    const pagination_total = try std.fmt.allocPrint(allocator, "{d}", .{pagination.total});
+    defer allocator.free(pagination_total);
     const rendered = try renderTemplate(allocator, layout, layout_path, .{
         .site = site,
         .page = page,
@@ -1731,6 +1868,11 @@ fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: [
         .runtime = runtime,
         .page_tags = page_tags,
         .page_full_title = page_full_title,
+        .pagination_nav = pagination_nav,
+        .pagination_current = pagination_current,
+        .pagination_total = pagination_total,
+        .pagination_previous_url = pagination.previous_url,
+        .pagination_next_url = pagination.next_url,
     });
     defer allocator.free(rendered);
     return applyTransitionNames(allocator, rendered);
@@ -1841,6 +1983,11 @@ fn templateValue(ctx: TemplateContext, expr: []const u8, layout_path: []const u8
     if (std.mem.eql(u8, name, "post_list")) return ctx.post_list;
     if (std.mem.eql(u8, name, "zlog.head")) return ctx.head;
     if (std.mem.eql(u8, name, "zlog.runtime")) return ctx.runtime;
+    if (std.mem.eql(u8, name, "pagination")) return ctx.pagination_nav;
+    if (std.mem.eql(u8, name, "pagination.current")) return ctx.pagination_current;
+    if (std.mem.eql(u8, name, "pagination.total")) return ctx.pagination_total;
+    if (std.mem.eql(u8, name, "pagination.previous_url")) return ctx.pagination_previous_url;
+    if (std.mem.eql(u8, name, "pagination.next_url")) return ctx.pagination_next_url;
     try failAtHint(layout_path, loc.line, loc.column, "unknown template binding '{s}'", .{name}, "Use a supported binding such as page.title, content, or zlog.head.");
     unreachable;
 }
@@ -2044,16 +2191,99 @@ fn findClosingTag(html: []const u8, start: usize, name: []const u8) ?ClosingTag 
 }
 
 fn renderPostList(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
+    return renderPostListPage(allocator, pages, site, 1, null);
+}
+
+fn renderPostListPage(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig, page_number: usize, tag_filter: ?[]const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
     try out.appendSlice("<section class=\"zlog-posts\">\n<h2>Posts</h2>\n<ul>\n");
+    var published_index: usize = 0;
+    const start = (page_number - 1) * site.page_size;
+    const end = start + site.page_size;
     for (pages) |p| if (p.is_post and !p.fm.draft) {
+        if (tag_filter) |tag| {
+            if (!hasTag(p, tag)) continue;
+        }
+        defer published_index += 1;
+        if (published_index < start or published_index >= end) continue;
         const prefetch = if (p.fm.prefetch.len > 0) p.fm.prefetch else site.prefetch_default;
-        try out.print("<li><a href=\"{s}\" data-z-prefetch=\"{s}\"><span style=\"view-transition-name:{s}\">", .{ p.url, prefetch, try safeCssIdent(allocator, if (p.fm.transition.len > 0) p.fm.transition else p.slug) });
+        const transition_name = try safeCssIdent(allocator, if (p.fm.transition.len > 0) p.fm.transition else p.slug);
+        defer allocator.free(transition_name);
+        try out.print("<li><a href=\"{s}\" data-z-prefetch=\"{s}\"><span style=\"view-transition-name:{s}\">", .{ p.url, prefetch, transition_name });
         try appendEscaped(&out, p.fm.title);
         try out.print("</span></a> <time>{s}</time></li>\n", .{p.fm.date});
     };
     try out.appendSlice("</ul>\n</section>\n");
     return out.toOwnedSlice();
+}
+
+fn renderArchiveListPage(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig, page_number: usize) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("<section class=\"zlog-archive\">\n<h2>Posts</h2>\n<ul>\n");
+    var published_index: usize = 0;
+    const start = (page_number - 1) * site.page_size;
+    const end = start + site.page_size;
+    for (pages) |p| if (p.is_post and !p.fm.draft) {
+        defer published_index += 1;
+        if (published_index < start or published_index >= end) continue;
+        const prefetch = if (p.fm.prefetch.len > 0) p.fm.prefetch else site.prefetch_default;
+        try out.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"{s}\">", .{ p.fm.date, p.url, prefetch });
+        try appendEscaped(&out, p.fm.title);
+        try out.appendSlice("</a></li>\n");
+    };
+    try out.appendSlice("</ul>\n</section>\n");
+    return out.toOwnedSlice();
+}
+
+fn renderPaginationNav(allocator: std.mem.Allocator, pagination: PaginationContext) ![]const u8 {
+    if (pagination.total <= 1) return allocator.dupe(u8, "");
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("<nav class=\"zlog-pagination\" aria-label=\"Pagination\">");
+    if (pagination.previous_url.len > 0) {
+        try out.appendSlice("<a rel=\"prev\" href=\"");
+        try appendEscaped(&out, pagination.previous_url);
+        try out.appendSlice("\">Previous</a> ");
+    }
+    try out.print("<span>Page {d} of {d}</span>", .{ pagination.current, pagination.total });
+    if (pagination.next_url.len > 0) {
+        try out.appendSlice(" <a rel=\"next\" href=\"");
+        try appendEscaped(&out, pagination.next_url);
+        try out.appendSlice("\">Next</a>");
+    }
+    try out.appendSlice("</nav>\n");
+    return out.toOwnedSlice();
+}
+
+fn listingPageUrl(allocator: std.mem.Allocator, base_url: []const u8, page_number: usize) ![]const u8 {
+    if (page_number == 1) return allocator.dupe(u8, base_url);
+    if (std.mem.eql(u8, base_url, "/")) return std.fmt.allocPrint(allocator, "/page/{d}/", .{page_number});
+    const base = std.mem.trimEnd(u8, base_url, "/");
+    return std.fmt.allocPrint(allocator, "{s}/page/{d}/", .{ base, page_number });
+}
+
+fn makePaginationContext(allocator: std.mem.Allocator, base_url: []const u8, current: usize, total: usize) !OwnedPaginationContext {
+    if (total <= 1) return .{};
+    var previous_url: []const u8 = "";
+    var next_url: []const u8 = "";
+    errdefer {
+        if (previous_url.len > 0) allocator.free(previous_url);
+        if (next_url.len > 0) allocator.free(next_url);
+    }
+    if (current > 1) previous_url = try listingPageUrl(allocator, base_url, current - 1);
+    if (current < total) next_url = try listingPageUrl(allocator, base_url, current + 1);
+    return .{
+        .context = .{
+            .current = current,
+            .total = total,
+            .previous_url = previous_url,
+            .next_url = next_url,
+        },
+        .previous_url = previous_url,
+        .next_url = next_url,
+    };
 }
 
 fn renderTagsInline(allocator: std.mem.Allocator, tags: []const []const u8) ![]const u8 {
@@ -2172,6 +2402,28 @@ fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const
     return out.toOwnedSlice();
 }
 
+fn renderIndexPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+    const total = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    if (total <= 1) return;
+    var page_number: usize = 2;
+    while (page_number <= total) : (page_number += 1) {
+        const url = try listingPageUrl(allocator, "/", page_number);
+        defer allocator.free(url);
+        const route = findRoute(routes, .index_page, url) orelse return fail("missing index pagination route for {s}", .{url});
+        const content = try std.fmt.allocPrint(allocator, "<h1>Posts</h1>\n", .{});
+        defer allocator.free(content);
+        const post_list = try renderPostListPage(allocator, pages, site, page_number, null);
+        defer allocator.free(post_list);
+        const pagination = try makePaginationContext(allocator, "/", page_number, total);
+        defer pagination.deinit(allocator);
+        const fake = Page{ .source_path = "", .slug = "posts", .url = url, .fm = .{ .title = "Posts", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+        const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+        defer allocator.free(rendered);
+        try validateHtmlDocument(allocator, rendered, route.out_path);
+        try writeAll(allocator, route.out_path, rendered);
+    }
+}
+
 fn renderTagPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     var seen = std.StringHashMap(void).init(allocator);
     defer {
@@ -2194,47 +2446,49 @@ fn renderTagPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Pag
             };
             const tag_url = try std.fmt.allocPrint(allocator, "/tags/{s}/", .{tag_slug});
             defer allocator.free(tag_url);
-            const route = findRoute(routes, .tag, tag_url) orelse return fail("missing tag route for {s}", .{tag_url});
-            const rendered = try renderTagPageHtml(allocator, tag, tag_slug, pages, site, head, runtime);
-            defer allocator.free(rendered);
-            try validateHtmlDocument(allocator, rendered, route.out_path);
-            try writeAll(allocator, route.out_path, rendered);
+            const total = paginationPageCount(countPublishedPostsWithTag(pages, tag), site.page_size);
+            var page_number: usize = 1;
+            while (page_number <= total) : (page_number += 1) {
+                const page_url = try listingPageUrl(allocator, tag_url, page_number);
+                defer allocator.free(page_url);
+                const route_kind: RouteKind = if (page_number == 1) .tag else .tag_page;
+                const route = findRoute(routes, route_kind, page_url) orelse return fail("missing tag route for {s}", .{page_url});
+                const content = try std.fmt.allocPrint(allocator, "<h1>#{s}</h1>\n", .{tag});
+                defer allocator.free(content);
+                const post_list = try renderPostListPage(allocator, pages, site, page_number, tag);
+                defer allocator.free(post_list);
+                const pagination = try makePaginationContext(allocator, tag_url, page_number, total);
+                defer pagination.deinit(allocator);
+                const fake = Page{ .source_path = "", .slug = tag_slug, .url = page_url, .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+                const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+                defer allocator.free(rendered);
+                try validateHtmlDocument(allocator, rendered, route.out_path);
+                try writeAll(allocator, route.out_path, rendered);
+            }
         }
     }
 }
 
-fn renderTagPageHtml(allocator: std.mem.Allocator, tag: []const u8, tag_slug: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) ![]const u8 {
-    var body = std.array_list.Managed(u8).init(allocator);
-    try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
-    for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
-        try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
-    };
-    try body.appendSlice("</ul>");
-    const body_html = try body.toOwnedSlice();
-    defer allocator.free(body_html);
-
-    const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-    return renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, body_html, "", head, runtime);
-}
-
 fn renderArchivePage(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
-    const rendered = try renderArchivePageHtml(allocator, pages, site, head, runtime);
-    defer allocator.free(rendered);
-    const route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
-    try validateHtmlDocument(allocator, rendered, route.out_path);
-    try writeAll(allocator, route.out_path, rendered);
-}
-
-fn renderArchivePageHtml(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) ![]const u8 {
-    var body = std.array_list.Managed(u8).init(allocator);
-    try body.appendSlice("<h1>Archive</h1>\n<ul>\n");
-    for (pages) |p| if (p.is_post and !p.fm.draft) try body.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ p.fm.date, p.url, p.fm.title });
-    try body.appendSlice("</ul>");
-    const body_html = try body.toOwnedSlice();
-    defer allocator.free(body_html);
-
-    const fake = Page{ .source_path = "", .slug = "archive", .url = "/archive/", .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-    return renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, body_html, "", head, runtime);
+    const total = paginationPageCount(countPublishedPosts(pages), site.page_size);
+    var page_number: usize = 1;
+    while (page_number <= total) : (page_number += 1) {
+        const page_url = try listingPageUrl(allocator, "/archive/", page_number);
+        defer allocator.free(page_url);
+        const route_kind: RouteKind = if (page_number == 1) .archive else .archive_page;
+        const route = findRoute(routes, route_kind, page_url) orelse return fail("missing archive route for {s}", .{page_url});
+        const content = try std.fmt.allocPrint(allocator, "<h1>Archive</h1>\n", .{});
+        defer allocator.free(content);
+        const post_list = try renderArchiveListPage(allocator, pages, site, page_number);
+        defer allocator.free(post_list);
+        const pagination = try makePaginationContext(allocator, "/archive/", page_number, total);
+        defer pagination.deinit(allocator);
+        const fake = Page{ .source_path = "", .slug = "archive", .url = page_url, .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+        const rendered = try renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, content, post_list, head, runtime, pagination.context);
+        defer allocator.free(rendered);
+        try validateHtmlDocument(allocator, rendered, route.out_path);
+        try writeAll(allocator, route.out_path, rendered);
+    }
 }
 
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
@@ -2468,7 +2722,7 @@ fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page
 
 fn includeInSitemap(route: Route) bool {
     return switch (route.kind) {
-        .page, .post, .tag, .archive => true,
+        .page, .post, .index_page, .tag, .tag_page, .archive, .archive_page => true,
         .rss, .sitemap, .static_asset => false,
     };
 }
@@ -2476,8 +2730,8 @@ fn includeInSitemap(route: Route) bool {
 fn sitemapLastmod(allocator: std.mem.Allocator, route: Route, pages: []Page) !?[]const u8 {
     return switch (route.kind) {
         .page, .post => if (findPageByUrl(pages, route.url)) |page| reliablePageTimestamp(page) else null,
-        .archive => latestReliableTimestamp(pages),
-        .tag => try latestReliableTimestampForTagRoute(allocator, route.url, pages),
+        .index_page, .archive, .archive_page => latestReliableTimestamp(pages),
+        .tag, .tag_page => try latestReliableTimestampForTagRoute(allocator, route.url, pages),
         .rss, .sitemap, .static_asset => null,
     };
 }
@@ -2512,7 +2766,9 @@ fn tagSlugFromRoute(route_url: []const u8) ?[]const u8 {
     const prefix = "/tags/";
     if (!std.mem.startsWith(u8, route_url, prefix) or !std.mem.endsWith(u8, route_url, "/")) return null;
     if (route_url.len <= prefix.len + 1) return null;
-    return route_url[prefix.len .. route_url.len - 1];
+    const rest = route_url[prefix.len .. route_url.len - 1];
+    if (std.mem.indexOf(u8, rest, "/page/")) |idx| return rest[0..idx];
+    return rest;
 }
 
 fn pageHasTagSlug(allocator: std.mem.Allocator, page: Page, route_slug: []const u8) !bool {
@@ -2535,6 +2791,27 @@ fn countPublishedPages(pages: []Page) usize {
         if (!page.fm.draft) count += 1;
     }
     return count;
+}
+
+fn countPublishedPosts(pages: []Page) usize {
+    var count: usize = 0;
+    for (pages) |page| {
+        if (page.is_post and !page.fm.draft) count += 1;
+    }
+    return count;
+}
+
+fn countPublishedPostsWithTag(pages: []Page, tag: []const u8) usize {
+    var count: usize = 0;
+    for (pages) |page| {
+        if (page.is_post and !page.fm.draft and hasTag(page, tag)) count += 1;
+    }
+    return count;
+}
+
+fn paginationPageCount(item_count: usize, page_size: usize) usize {
+    if (item_count == 0) return 1;
+    return 1 + ((item_count - 1) / page_size);
 }
 
 fn hasTag(page: Page, tag: []const u8) bool {
@@ -2710,6 +2987,7 @@ const initConfig =
     \\.timezone = "UTC",
     \\.author = "Example Author",
     \\.permalink = "/posts/:year/:month/:slug/",
+    \\.page_size = 10,
     \\.content_dir = "content",
     \\.layouts_dir = "layouts",
     \\.out_dir = "public",
@@ -2750,7 +3028,7 @@ const initPost =
 const initBaseLayout =
     \\<!doctype html>
     \\<html z-attr:lang="site.language"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
-    \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><main><template z-replace="content"></template><template z-replace="post_list"></template></main><template z-replace="zlog.runtime"></template></body></html>
+    \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><main><template z-replace="content"></template><template z-replace="post_list"></template><template z-replace="pagination"></template></main><template z-replace="zlog.runtime"></template></body></html>
 ;
 const initPostLayout =
     \\<!doctype html>
@@ -2772,6 +3050,7 @@ test "site config reads metadata fields and renders head metadata" {
         \\.timezone = "+09:00",
         \\.author = "Example Author",
         \\.speculation_rules = false,
+        \\.page_size = 3,
         ,
     });
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2784,6 +3063,7 @@ test "site config reads metadata fields and renders head metadata" {
     try std.testing.expectEqualStrings("+09:00", site.timezone);
     try std.testing.expectEqualStrings("Example Author", site.author);
     try std.testing.expectEqualStrings("/:slug/", site.permalink);
+    try std.testing.expectEqual(@as(usize, 3), site.page_size);
 
     const head = try renderHead(std.testing.allocator, site);
     defer std.testing.allocator.free(head);
@@ -2801,6 +3081,7 @@ test "site config rejects invalid metadata fields" {
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/posts/:unknown/" }, "zlog.ziggy"));
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/posts//:slug/" }, "zlog.ziggy"));
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/../:slug/" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .page_size = 0 }, "zlog.ziggy"));
 }
 
 test "frontmatter parser reads title tags and draft" {
@@ -3005,6 +3286,33 @@ test "route graph centralizes published routes and static assets" {
     try std.testing.expect(routes.containsUrl("/assets/icons/logo.bin"));
 }
 
+test "pagination routes are generated for index tag and archive listings" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site");
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false },
+        .{ .source_path = "content/posts/a.md", .slug = "a", .url = "/a/", .fm = .{ .title = "A", .date = "2026-06-28", .tags = &[_][]const u8{"zig"} }, .markdown = "", .html = "", .is_post = true },
+        .{ .source_path = "content/posts/b.md", .slug = "b", .url = "/b/", .fm = .{ .title = "B", .date = "2026-06-27", .tags = &[_][]const u8{"zig"} }, .markdown = "", .html = "", .is_post = true },
+    };
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{ .page_size = 1 }, pages[0..]);
+    defer routes.deinit();
+    try std.testing.expect(routes.containsUrl("/page/2/"));
+    try std.testing.expect(routes.containsUrl("/tags/zig/page/2/"));
+    try std.testing.expect(routes.containsUrl("/archive/page/2/"));
+
+    const pagination = try makePaginationContext(std.testing.allocator, "/", 1, 2);
+    defer pagination.deinit(std.testing.allocator);
+    const html = try renderLayout(std.testing.allocator, initBaseLayout, "<test layout>", .{ .title = "Example" }, pages[0], "", "", "", "", pagination.context);
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "Page 1 of 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "href=\"/page/2/\"") != null);
+}
+
 test "static assets are copied recursively without changing bytes" {
     runtime_io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3074,7 +3382,7 @@ test "rendered image tags receive known local dimensions" {
     const layout =
         \\<html><body><main><img src="/img/logo.png" alt="Template" width="3"><template z-replace="content"></template></main></body></html>
     ;
-    const html = try renderPageOutputHtml(std.testing.allocator, .{ .path = "<test layout>", .html = layout }, .{}, pages[0], pages[0].html, "", "", "", route.out_path, assets);
+    const html = try renderPageOutputHtml(std.testing.allocator, .{ .path = "<test layout>", .html = layout }, .{}, pages[0], pages[0].html, "", "", "", route.out_path, assets, .{});
     defer std.testing.allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "src=\"/img/logo.png\"") != null);
@@ -3219,7 +3527,7 @@ test "template renderer applies attributes and raw slots" {
         .html = "",
         .is_post = true,
     };
-    const html = try renderLayout(std.testing.allocator, initPostLayout, "<test layout>", .{ .title = "Example" }, page, "<p>Body</p>", "", "", "");
+    const html = try renderLayout(std.testing.allocator, initPostLayout, "<test layout>", .{ .title = "Example" }, page, "<p>Body</p>", "", "", "", .{});
     defer std.testing.allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "<title>A &amp; B - Example</title>") != null);
@@ -3240,6 +3548,11 @@ test "template renderer rejects invalid structure and legacy tokens" {
         .runtime = "",
         .page_tags = "",
         .page_full_title = "Home - zlog site",
+        .pagination_nav = "",
+        .pagination_current = "1",
+        .pagination_total = "1",
+        .pagination_previous_url = "",
+        .pagination_next_url = "",
     };
     try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main><p></main>", "<test layout>", ctx));
     try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main>{{content}}</main>", "<test layout>", ctx));

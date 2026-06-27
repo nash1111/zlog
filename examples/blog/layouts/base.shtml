@@ -11,6 +11,7 @@
   <main>
     <template z-replace="content"></template>
     <template z-replace="post_list"></template>
+    <template z-replace="pagination"></template>
   </main>
   <template z-replace="zlog.runtime"></template>
 </body>
