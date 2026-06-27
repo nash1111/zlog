@@ -4,6 +4,9 @@ var runtime_io: std.Io = undefined;
 const SiteConfig = struct {
     title: []const u8 = "zlog site",
     url: []const u8 = "http://localhost:1111",
+    language: []const u8 = "en",
+    timezone: []const u8 = "UTC",
+    author: []const u8 = "",
     content_dir: []const u8 = "content",
     layouts_dir: []const u8 = "layouts",
     out_dir: []const u8 = "public",
@@ -296,7 +299,8 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     try copySiteAssets(allocator, assets);
 
     const post_list = try renderPostList(allocator, pages.items, site);
-    const head = renderHead(site);
+    const head = try renderHead(allocator, site);
+    defer allocator.free(head);
     const runtime = prefetchRuntime;
 
     for (pages.items) |page| {
@@ -558,7 +562,8 @@ fn loadLayoutForPage(allocator: std.mem.Allocator, dir: []const u8, site: SiteCo
 
 fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph, assets: AssetGraph) !void {
     const post_list = try renderPostList(allocator, pages, site);
-    const head = renderHead(site);
+    const head = try renderHead(allocator, site);
+    defer allocator.free(head);
     const runtime = prefetchRuntime;
 
     for (pages) |page| {
@@ -627,15 +632,79 @@ fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
     };
     const doc = try parseZiggyFields(allocator, text, path, 1);
     defer allocator.free(doc.fields);
-    return SiteConfig{
+    const site = SiteConfig{
         .title = try ziggyString(doc, path, "title", "zlog site"),
         .url = try ziggyString(doc, path, "url", "http://localhost:1111"),
+        .language = try ziggyString(doc, path, "language", "en"),
+        .timezone = try ziggyString(doc, path, "timezone", "UTC"),
+        .author = try ziggyString(doc, path, "author", ""),
         .content_dir = try ziggyString(doc, path, "content_dir", "content"),
         .layouts_dir = try ziggyString(doc, path, "layouts_dir", "layouts"),
         .out_dir = try ziggyString(doc, path, "out_dir", "public"),
         .prefetch_default = try ziggyString(doc, path, "prefetch_default", "hover"),
         .speculation_rules = try ziggyBool(doc, path, "speculation_rules", true),
     };
+    try validateSiteConfig(site, path);
+    return site;
+}
+
+fn validateSiteConfig(site: SiteConfig, path: []const u8) !void {
+    if (!validSiteUrl(site.url)) return failAtHint(path, 1, 1, "invalid site url '{s}'", .{site.url}, "Set .url to an absolute http:// or https:// URL.");
+    if (!validLanguageTag(site.language)) return failAtHint(path, 1, 1, "invalid language tag '{s}'", .{site.language}, "Use a BCP47-style language tag such as en or en-US.");
+    if (!validTimezone(site.timezone)) return failAtHint(path, 1, 1, "invalid timezone '{s}'", .{site.timezone}, "Use UTC, an offset such as +09:00, or an IANA-style name such as Asia/Tokyo.");
+    if (!validAuthor(site.author)) return failAtHint(path, 1, 1, "invalid author value", .{}, "Keep .author to a single line without control characters.");
+}
+
+fn validSiteUrl(url: []const u8) bool {
+    const has_supported_scheme = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+    if (!has_supported_scheme) return false;
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
+    if (url.len <= scheme_end + 3) return false;
+    for (url) |c| if (std.ascii.isWhitespace(c)) return false;
+    return true;
+}
+
+fn validLanguageTag(language: []const u8) bool {
+    if (language.len == 0 or language[0] == '-' or language[language.len - 1] == '-') return false;
+    var part_len: usize = 0;
+    var part_count: usize = 0;
+    for (language) |c| {
+        if (c == '-') {
+            if (part_len == 0 or part_len > 8) return false;
+            part_count += 1;
+            part_len = 0;
+            continue;
+        }
+        if (!std.ascii.isAlphanumeric(c)) return false;
+        part_len += 1;
+    }
+    if (part_len == 0 or part_len > 8) return false;
+    return part_count < 8;
+}
+
+fn validTimezone(timezone: []const u8) bool {
+    if (std.mem.eql(u8, timezone, "UTC")) return true;
+    if (parseTimezoneOffset(timezone) != null) return true;
+    return validTimezoneName(timezone);
+}
+
+fn validTimezoneName(timezone: []const u8) bool {
+    if (timezone.len == 0 or timezone[0] == '/' or timezone[timezone.len - 1] == '/') return false;
+    var has_slash = false;
+    for (timezone) |c| {
+        if (c == '/') {
+            has_slash = true;
+            continue;
+        }
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '+')) return false;
+    }
+    return has_slash;
+}
+
+fn validAuthor(author: []const u8) bool {
+    if (author.len > 256) return false;
+    for (author) |c| if (std.ascii.isControl(c)) return false;
+    return true;
 }
 
 fn loadPages(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !std.array_list.Managed(Page) {
@@ -1706,6 +1775,10 @@ fn templateAction(tag: []const u8) TemplateAction {
 fn templateValue(ctx: TemplateContext, expr: []const u8, layout_path: []const u8, loc: SourceLocation) ![]const u8 {
     const name = std.mem.trim(u8, expr, " \t\r\n");
     if (std.mem.eql(u8, name, "site.title")) return ctx.site.title;
+    if (std.mem.eql(u8, name, "site.url")) return ctx.site.url;
+    if (std.mem.eql(u8, name, "site.language")) return ctx.site.language;
+    if (std.mem.eql(u8, name, "site.timezone")) return ctx.site.timezone;
+    if (std.mem.eql(u8, name, "site.author")) return ctx.site.author;
     if (std.mem.eql(u8, name, "page.title")) return ctx.page.fm.title;
     if (std.mem.eql(u8, name, "page.full_title")) return ctx.page_full_title;
     if (std.mem.eql(u8, name, "page.date")) return ctx.page.fm.date;
@@ -1941,17 +2014,35 @@ fn renderTagsInline(allocator: std.mem.Allocator, tags: []const []const u8) ![]c
     return out.toOwnedSlice();
 }
 
-fn renderHead(site: SiteConfig) []const u8 {
-    _ = site;
-    return
-    \\<style>
-    \\@view-transition { navigation: auto; }
-    \\@media (prefers-reduced-motion: reduce) { ::view-transition-group(*) { animation-duration: 0.01ms; } }
-    \\body { max-width: 72ch; margin: 3rem auto; padding: 0 1rem; font: 16px/1.6 system-ui, sans-serif; }
-    \\img { max-width: 100%; height: auto; }
-    \\</style>
-    \\<script type="speculationrules">{"prefetch":[{"where":{"selector_matches":"[data-z-prefetch='tap']"},"eagerness":"conservative"},{"where":{"selector_matches":"[data-z-prefetch='hover']"},"eagerness":"moderate"}]}</script>
-    ;
+fn renderHead(allocator: std.mem.Allocator, site: SiteConfig) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice(
+        \\<style>
+        \\@view-transition { navigation: auto; }
+        \\@media (prefers-reduced-motion: reduce) { ::view-transition-group(*) { animation-duration: 0.01ms; } }
+        \\body { max-width: 72ch; margin: 3rem auto; padding: 0 1rem; font: 16px/1.6 system-ui, sans-serif; }
+        \\img { max-width: 100%; height: auto; }
+        \\</style>
+        \\
+    );
+    try out.appendSlice("<meta property=\"og:site_name\" content=\"");
+    try appendEscaped(&out, site.title);
+    try out.appendSlice("\">\n<meta name=\"zlog:timezone\" content=\"");
+    try appendEscaped(&out, site.timezone);
+    try out.appendSlice("\">\n");
+    if (site.author.len > 0) {
+        try out.appendSlice("<meta name=\"author\" content=\"");
+        try appendEscaped(&out, site.author);
+        try out.appendSlice("\">\n");
+    }
+    if (site.speculation_rules) {
+        try out.appendSlice(
+            \\<script type="speculationrules">{"prefetch":[{"where":{"selector_matches":"[data-z-prefetch='tap']"},"eagerness":"conservative"},{"where":{"selector_matches":"[data-z-prefetch='hover']"},"eagerness":"moderate"}]}</script>
+            \\
+        );
+    }
+    return out.toOwnedSlice();
 }
 
 const prefetchRuntime =
@@ -2107,11 +2198,19 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
     try appendXmlEscaped(&out, site_url);
     try out.appendSlice("</link>\n<description>");
     try appendXmlEscaped(&out, site.title);
-    try out.appendSlice("</description>\n<atom:link href=\"");
+    try out.appendSlice("</description>\n<language>");
+    try appendXmlEscaped(&out, site.language);
+    try out.appendSlice("</language>\n");
+    if (site.author.len > 0) {
+        try out.appendSlice("<dc:creator>");
+        try appendXmlEscaped(&out, site.author);
+        try out.appendSlice("</dc:creator>\n");
+    }
+    try out.appendSlice("<atom:link href=\"");
     try appendXmlEscaped(&out, feed_url);
     try out.appendSlice("\" rel=\"self\" type=\"application/rss+xml\" />\n");
     if (latestRssTimestamp(pages)) |latest| {
-        const latest_date = try formatRssDate(allocator, latest);
+        const latest_date = try formatRssDate(allocator, latest, site.timezone);
         defer allocator.free(latest_date);
         try out.appendSlice("<lastBuildDate>");
         try appendXmlEscaped(&out, latest_date);
@@ -2120,7 +2219,7 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
     for (pages) |p| if (p.is_post and !p.fm.draft) {
         const item_url = try absoluteSiteUrl(allocator, site, p.url);
         defer allocator.free(item_url);
-        const pub_date = try formatRssDate(allocator, p.fm.date);
+        const pub_date = try formatRssDate(allocator, p.fm.date, site.timezone);
         defer allocator.free(pub_date);
         try out.appendSlice("<item>\n<title>");
         try appendXmlEscaped(&out, p.fm.title);
@@ -2131,6 +2230,11 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
         try out.appendSlice("</guid>\n<pubDate>");
         try appendXmlEscaped(&out, pub_date);
         try out.appendSlice("</pubDate>\n");
+        if (site.author.len > 0) {
+            try out.appendSlice("<dc:creator>");
+            try appendXmlEscaped(&out, site.author);
+            try out.appendSlice("</dc:creator>\n");
+        }
         if (p.fm.updated.len > 0) {
             try out.appendSlice("<dc:date>");
             try appendXmlEscaped(&out, p.fm.updated);
@@ -2175,8 +2279,8 @@ const RssTimestamp = struct {
 const rss_weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 const rss_months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
-fn formatRssDate(allocator: std.mem.Allocator, timestamp: []const u8) ![]const u8 {
-    const parsed = parseIsoTimestamp(timestamp) orelse return allocator.dupe(u8, timestamp);
+fn formatRssDate(allocator: std.mem.Allocator, timestamp: []const u8, timezone: []const u8) ![]const u8 {
+    const parsed = parseIsoTimestampWithTimezone(timestamp, timezone) orelse return allocator.dupe(u8, timestamp);
     return std.fmt.allocPrint(
         allocator,
         "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} {s}",
@@ -2194,12 +2298,17 @@ fn formatRssDate(allocator: std.mem.Allocator, timestamp: []const u8) ![]const u
 }
 
 fn parseIsoTimestamp(timestamp: []const u8) ?RssTimestamp {
+    return parseIsoTimestampWithTimezone(timestamp, "UTC");
+}
+
+fn parseIsoTimestampWithTimezone(timestamp: []const u8, timezone: []const u8) ?RssTimestamp {
     if (timestamp.len < 10) return null;
     if (timestamp[4] != '-' or timestamp[7] != '-') return null;
     var parsed = RssTimestamp{
         .year = parseFixedInt(u16, timestamp[0..4]) catch return null,
         .month = parseFixedInt(u8, timestamp[5..7]) catch return null,
         .day = parseFixedInt(u8, timestamp[8..10]) catch return null,
+        .zone = rssTimezoneOffset(timezone),
     };
     if (!validDate(parsed.year, parsed.month, parsed.day)) return null;
     if (timestamp.len == 10) return parsed;
@@ -2228,6 +2337,21 @@ fn parseIsoTimestamp(timestamp: []const u8) ?RssTimestamp {
         return parsed;
     }
     return null;
+}
+
+fn rssTimezoneOffset(timezone: []const u8) [5]u8 {
+    if (std.mem.eql(u8, timezone, "UTC")) return .{ '+', '0', '0', '0', '0' };
+    return parseTimezoneOffset(timezone) orelse .{ '+', '0', '0', '0', '0' };
+}
+
+fn parseTimezoneOffset(timezone: []const u8) ?[5]u8 {
+    if (timezone.len != 6) return null;
+    if (timezone[0] != '+' and timezone[0] != '-') return null;
+    if (timezone[3] != ':') return null;
+    const hour = parseFixedInt(u8, timezone[1..3]) catch return null;
+    const minute = parseFixedInt(u8, timezone[4..6]) catch return null;
+    if (hour > 23 or minute > 59) return null;
+    return .{ timezone[0], timezone[1], timezone[2], timezone[4], timezone[5] };
 }
 
 fn parseFixedInt(comptime T: type, digits: []const u8) !T {
@@ -2459,6 +2583,9 @@ fn writeNew(allocator: std.mem.Allocator, base: []const u8, rel: []const u8, tex
 const initConfig =
     \\.title = "example.dev",
     \\.url = "https://example.dev",
+    \\.language = "en",
+    \\.timezone = "UTC",
+    \\.author = "Example Author",
     \\.content_dir = "content",
     \\.layouts_dir = "layouts",
     \\.out_dir = "public",
@@ -2497,14 +2624,54 @@ const initPost =
 ;
 const initBaseLayout =
     \\<!doctype html>
-    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
+    \\<html z-attr:lang="site.language"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
     \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><main><template z-replace="content"></template><template z-replace="post_list"></template></main><template z-replace="zlog.runtime"></template></body></html>
 ;
 const initPostLayout =
     \\<!doctype html>
-    \\<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
+    \\<html z-attr:lang="site.language"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title z-text="page.full_title"></title><template z-replace="zlog.head"></template></head>
     \\<body><header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header><article><h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1><p><time z-text="page.date"></time> <span z-replace="page.tags"></span></p><template z-replace="content"></template></article><template z-replace="zlog.runtime"></template></body></html>
 ;
+
+test "site config reads metadata fields and renders head metadata" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/zlog.ziggy",
+        .data =
+        \\.title = "Example",
+        \\.url = "https://example.com",
+        \\.language = "en-US",
+        \\.timezone = "+09:00",
+        \\.author = "Example Author",
+        \\.speculation_rules = false,
+        ,
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+    const root = try std.fmt.allocPrint(arena_allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    const site = try loadSite(arena_allocator, root);
+    try std.testing.expectEqualStrings("https://example.com", site.url);
+    try std.testing.expectEqualStrings("en-US", site.language);
+    try std.testing.expectEqualStrings("+09:00", site.timezone);
+    try std.testing.expectEqualStrings("Example Author", site.author);
+
+    const head = try renderHead(std.testing.allocator, site);
+    defer std.testing.allocator.free(head);
+    try std.testing.expect(std.mem.indexOf(u8, head, "<meta name=\"author\" content=\"Example Author\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "<meta name=\"zlog:timezone\" content=\"+09:00\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, head, "speculationrules") == null);
+}
+
+test "site config rejects invalid metadata fields" {
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .url = "example.com" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .language = "en_US" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .timezone = "Tokyo" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .author = "Bad\nAuthor" }, "zlog.ziggy"));
+}
 
 test "frontmatter parser reads title tags and draft" {
     const text =
@@ -2573,10 +2740,12 @@ test "rss output uses absolute escaped item metadata" {
         .{ .source_path = "content/posts/live.md", .slug = "live", .url = "/live/", .fm = .{ .title = "A & B", .date = "2026-06-27T00:00:00Z", .updated = "2026-06-28T00:00:00Z" }, .markdown = "", .html = "<p>A & B</p>", .is_post = true },
         .{ .source_path = "content/posts/draft.md", .slug = "draft", .url = "/draft/", .fm = .{ .title = "Draft", .date = "2026-06-27T00:00:00Z", .draft = true }, .markdown = "", .html = "", .is_post = true },
     };
-    const rss = try renderRss(std.testing.allocator, pages[0..], .{ .title = "Site & Feed", .url = "https://example.com/blog/" });
+    const rss = try renderRss(std.testing.allocator, pages[0..], .{ .title = "Site & Feed", .url = "https://example.com/blog/", .language = "en-US", .author = "Example Author" });
     defer std.testing.allocator.free(rss);
     try std.testing.expect(std.mem.indexOf(u8, rss, "<link>https://example.com/blog/live/</link>") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "<guid isPermaLink=\"true\">https://example.com/blog/live/</guid>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<language>en-US</language>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<dc:creator>Example Author</dc:creator>") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "<title>A &amp; B</title>") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "<pubDate>Sat, 27 Jun 2026 00:00:00 +0000</pubDate>") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "<lastBuildDate>Sun, 28 Jun 2026 00:00:00 +0000</lastBuildDate>") != null);
@@ -2586,19 +2755,23 @@ test "rss output uses absolute escaped item metadata" {
 }
 
 test "rss date formatting converts iso timestamps" {
-    const dated = try formatRssDate(std.testing.allocator, "2026-06-23");
+    const dated = try formatRssDate(std.testing.allocator, "2026-06-23", "UTC");
     defer std.testing.allocator.free(dated);
     try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0000", dated);
 
-    const offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+09:00");
+    const offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+09:00", "UTC");
     defer std.testing.allocator.free(offset);
     try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0900", offset);
 
-    const unchanged = try formatRssDate(std.testing.allocator, "Tue, 23 Jun 2026 00:00:00 +0900");
+    const site_zone = try formatRssDate(std.testing.allocator, "2026-06-23", "+09:00");
+    defer std.testing.allocator.free(site_zone);
+    try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0900", site_zone);
+
+    const unchanged = try formatRssDate(std.testing.allocator, "Tue, 23 Jun 2026 00:00:00 +0900", "UTC");
     defer std.testing.allocator.free(unchanged);
     try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0900", unchanged);
 
-    const invalid_offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+99:00");
+    const invalid_offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+99:00", "UTC");
     defer std.testing.allocator.free(invalid_offset);
     try std.testing.expectEqualStrings("2026-06-23T00:00:00+99:00", invalid_offset);
 }
@@ -2929,7 +3102,9 @@ test "html validation covers generated listing pages during check" {
 
     var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
     defer routes.deinit();
-    try std.testing.expectError(error.InvalidSite, validateGeneratedListingHtml(std.testing.allocator, routes, pages[0..], .{}, renderHead(.{}), prefetchRuntime));
+    const head = try renderHead(std.testing.allocator, .{});
+    defer std.testing.allocator.free(head);
+    try std.testing.expectError(error.InvalidSite, validateGeneratedListingHtml(std.testing.allocator, routes, pages[0..], .{}, head, prefetchRuntime));
 }
 
 test "dev server resolves route paths into public files" {

@@ -40,7 +40,17 @@ zig build
 
 The generated site is written to `public/` by default.
 
-Set `.url` in `zlog.ziggy` to the canonical public URL for the site. RSS and sitemap output use this value for absolute URLs.
+Site-wide metadata lives in `zlog.ziggy`:
+
+```ziggy
+.title = "example.dev",
+.url = "https://example.dev",
+.language = "en",
+.timezone = "UTC",
+.author = "Example Author",
+```
+
+RSS and sitemap output use `.url` for absolute URLs. RSS, generated metadata, and templates can also consume `.language`, `.timezone`, and `.author`.
 
 `zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
