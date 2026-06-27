@@ -1,0 +1,10 @@
+.title = "Example Portfolio"
+.url = "https://portfolio.example.test"
+.language = "en"
+.author = "Example Designer"
+.content_dir = "content"
+.layouts_dir = "layouts"
+.out_dir = "public"
+.permalink = "/work/:slug/"
+.prefetch_default = "viewport"
+.search_index = true

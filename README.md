@@ -1,76 +1,168 @@
 # zlog
 
-`zlog` is a tiny Zig-native blog/static-site generator prototype based on the plan in `zig-blog-ssg-framework-plan.md`.
+zlog is a Zig-native static site generator for small blogs and documentation sites.
 
-## MVP scope
+It builds Markdown content into static HTML, tag pages, category pages, archive pages, RSS, sitemap, and a JSON search index. The core build and check commands only use local file input and output.
 
-Implemented now:
+## Install
 
-- `zlog init [dir]` scaffold with `zlog.ziggy`, `content/index.md`, `content/posts/hello.md`, `layouts/base.shtml`, and `layouts/post.shtml`.
-- `zlog check [dir]` for config/frontmatter parsing, required title/date checks on posts, duplicate heading IDs, and broken internal Markdown links.
-- `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
-- `zlog dev [dir]` as a minimal rebuild-once development command placeholder.
-
-Not implemented yet: real SuperHTML/Ziggy integration, cmark-gfm, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
-
-## Build and test
-
-This MVP was verified with Zig built from Codeberg `ziglang/zig` default branch (`master`, current development line) at commit `8f7febfa6f5900e64bee1636c2bbc13bd5a52bd6`, producing `stage3/bin/zig` reporting `0.17.0`.
+Build from source with Zig 0.16.0:
 
 ```bash
-zig build test
-zig build
-./zig-out/bin/zlog --help
+zig build -Doptimize=ReleaseSafe
 ```
 
-If Zig is not installed locally, install a recent Zig release first, or build the current Codeberg development branch and use its `stage3/bin/zig`.
+The binary is written to:
 
-## Usage
+```bash
+zig-out/bin/zlog
+```
+
+## Quickstart
 
 ```bash
 zig build
-./zig-out/bin/zlog init my-blog
-./zig-out/bin/zlog check my-blog
-./zig-out/bin/zlog build my-blog
+./zig-out/bin/zlog init my-site
+./zig-out/bin/zlog check my-site
+./zig-out/bin/zlog build my-site
 ```
 
 The generated site is written to `public/` by default.
 
+For local browser preview after a build, use the helper script:
+
+```bash
+python3 tools/preview_static.py my-site/public --port 8000
+```
+
+The preview script is intentionally separate from the `zlog` binary.
+
+## Commands
+
+```bash
+zlog init [dir]
+zlog check [dir]
+zlog build [dir]
+zlog dev [dir]
+```
+
+- `init` creates a starter site.
+- `check` validates content schema, internal links, duplicate heading IDs, duplicate transition names, and generated HTML structure.
+- `build` writes static output.
+- `dev` rebuilds once, then watches local files and rebuilds on change. It does not start an HTTP server.
+
+## Configuration
+
+Configuration lives in `zlog.ziggy`.
+
+```zig
+.title = "example.dev"
+.url = "https://example.dev"
+.language = "en"
+.timezone = "UTC"
+.author = "Example Author"
+.content_dir = "content"
+.layouts_dir = "layouts"
+.out_dir = "public"
+.permalink = "/:slug/"
+.page_size = 10
+.prefetch_default = "hover"
+.speculation_rules = true
+.search_index = true
+```
+
+Important fields:
+
+- `url`: used for absolute RSS and sitemap URLs.
+- `permalink`: supports `:slug`, `:year`, `:month`, and `:day`.
+- `page_size`: controls listing pagination.
+- `prefetch_default`: one of `hover`, `tap`, `viewport`, `load`, or `false`.
+
 ## Frontmatter
 
-Ziggy-like frontmatter is supported for the MVP:
+zlog uses Ziggy-style frontmatter as the native format. A small YAML-style import path is also accepted for migration.
 
 ```md
 ---
-.title = "Hello zlog",
-.date = "2026-06-23T00:00:00+09:00",
-.tags = ["zig", "ssg"],
-.layout = "post.shtml",
-.draft = false,
-.prefetch = "hover",
-.transition = "post-title:hello",
+.title = "Hello zlog"
+.description = "A first post."
+.date = "2026-06-27"
+.updated = "2026-06-27"
+.slug = "hello-zlog"
+.tags = ["zig", "ssg"]
+.categories = ["notes"]
+.layout = "post.shtml"
+.draft = false
+.prefetch = "hover"
+.transition = "post-title:hello"
 ---
 
 # Hello
 ```
 
-## Template tokens
+Draft posts are excluded from production builds.
 
-The MVP uses small HTML-first token replacement instead of a full SuperHTML renderer:
+## Markdown
+
+The built-in renderer supports the common Markdown needed by the examples:
+
+- headings with generated IDs
+- paragraphs, links, images, and autolinks
+- unordered lists
+- blockquotes
+- fenced code blocks with language classes
+- simple pipe tables
+- emphasis and strong emphasis
+
+The renderer is intentionally isolated so it can be replaced by a full cmark-gfm integration later.
+
+## Layouts
+
+Layouts are HTML files in the configured `layouts_dir`.
+
+Available tokens:
 
 - `{{site.title}}`
+- `{{site.url}}`
+- `{{site.language}}`
+- `{{site.author}}`
 - `{{page.title}}`
+- `{{page.description}}`
 - `{{page.date}}`
+- `{{page.updated}}`
 - `{{page.tags}}`
+- `{{page.categories}}`
+- `{{page.series}}`
+- `{{page.transition}}`
+- `{{toc}}`
 - `{{content}}`
 - `{{post_list}}`
 - `{{zlog.head}}`
 - `{{zlog.runtime}}`
 
-## Navigation hints
+The generated HTML is validated during `check` and `build`.
 
-Generated pages include:
+## Static Assets
 
-- `@view-transition { navigation: auto; }` CSS.
-- `script type="speculationrules"` rules for `tap` and `hover` links.
-- a tiny JS fallback for `hover`, `tap`, `viewport`, and `load` prefetch values.
+Files under `static/` are copied recursively into the output directory.
+
+For local PNG and JPEG images referenced from static assets, zlog adds `width` and `height` attributes when they are missing.
+
+## Deploy
+
+Deploy the configured output directory, usually `public/`, to any static host.
+
+```bash
+./zig-out/bin/zlog check .
+./zig-out/bin/zlog build .
+```
+
+Set `url` before publishing so RSS and sitemap output use absolute production URLs.
+
+## Examples
+
+- `examples/blog`
+- `examples/docs`
+- `examples/portfolio`
+
+Each example can be checked and built with the local binary.

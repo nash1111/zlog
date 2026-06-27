@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="{{site.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{page.description}}">
+  <title>{{page.title}} - {{site.title}}</title>
+  {{zlog.head}}
+</head>
+<body>
+  <header>
+    <a href="/" data-z-prefetch="hover">{{site.title}}</a>
+    <nav><a href="/docs/getting-started/" data-z-prefetch="hover">Start</a></nav>
+  </header>
+  <main>{{content}}{{post_list}}</main>
+  {{zlog.runtime}}
+</body>
+</html>

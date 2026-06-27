@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="{{site.language}}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="{{page.description}}">
+  <title>{{page.title}} - {{site.title}}</title>
+  {{zlog.head}}
+</head>
+<body>
+  <header><a href="/" data-z-prefetch="hover">{{site.title}}</a></header>
+  <aside>{{toc}}</aside>
+  <article>
+    <h1 z-transition-name="{{page.transition}}">{{page.title}}</h1>
+    {{content}}
+  </article>
+  {{zlog.runtime}}
+</body>
+</html>
