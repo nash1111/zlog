@@ -73,6 +73,59 @@ const Page = struct {
     is_post: bool,
 };
 
+const RouteKind = enum { page, post, tag, archive, rss, sitemap, static_asset };
+
+const Route = struct {
+    kind: RouteKind,
+    source_path: []const u8 = "",
+    url: []const u8,
+    out_path: []const u8,
+};
+
+const RouteGraph = struct {
+    allocator: std.mem.Allocator,
+    routes: std.array_list.Managed(Route),
+    owned_strings: std.array_list.Managed([]const u8),
+
+    fn init(allocator: std.mem.Allocator) RouteGraph {
+        return .{
+            .allocator = allocator,
+            .routes = std.array_list.Managed(Route).init(allocator),
+            .owned_strings = std.array_list.Managed([]const u8).init(allocator),
+        };
+    }
+
+    fn deinit(self: *RouteGraph) void {
+        for (self.owned_strings.items) |value| self.allocator.free(value);
+        self.owned_strings.deinit();
+        self.routes.deinit();
+    }
+
+    fn add(self: *RouteGraph, route: Route) !void {
+        try self.routes.append(route);
+    }
+
+    fn own(self: *RouteGraph, value: []const u8) ![]const u8 {
+        errdefer self.allocator.free(value);
+        try self.owned_strings.append(value);
+        return value;
+    }
+
+    fn containsUrl(self: RouteGraph, url: []const u8) bool {
+        for (self.routes.items) |route| {
+            if (std.mem.eql(u8, route.url, url)) return true;
+        }
+        return false;
+    }
+
+    fn firstByKind(self: RouteGraph, kind: RouteKind) ?Route {
+        for (self.routes.items) |route| {
+            if (route.kind == kind) return route;
+        }
+        return null;
+    }
+};
+
 const CliError = error{Usage};
 
 pub fn main(init: std.process.Init) !void {
@@ -141,7 +194,9 @@ fn cmdCheck(allocator: std.mem.Allocator, dir: []const u8) !void {
     const site = try loadSite(allocator, dir);
     var pages = try loadPages(allocator, dir, site);
     defer pages.deinit();
-    try validatePages(allocator, pages.items);
+    var routes = try buildRouteGraph(allocator, dir, site, pages.items);
+    defer routes.deinit();
+    try validatePages(allocator, pages.items, routes);
     try stdout("check ok: {d} pages\n", .{pages.items.len});
 }
 
@@ -149,11 +204,13 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     const site = try loadSite(allocator, dir);
     var pages = try loadPages(allocator, dir, site);
     defer pages.deinit();
-    try validatePages(allocator, pages.items);
+    var routes = try buildRouteGraph(allocator, dir, site, pages.items);
+    defer routes.deinit();
+    try validatePages(allocator, pages.items, routes);
 
     const out_dir = try join(allocator, &.{ dir, site.out_dir });
     try cleanAndCreate(out_dir);
-    try copyStaticIfPresent(allocator, dir, out_dir);
+    try copyStaticRoutes(allocator, routes);
 
     const post_list = try renderPostList(allocator, pages.items, site);
     const head = renderHead(site);
@@ -169,15 +226,16 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
         };
         const rendered = try renderLayout(allocator, layout, site, page, page.html, post_list, head, runtime);
         const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
-        const rel = if (std.mem.eql(u8, page.url, "/")) "index.html" else try std.fmt.allocPrint(allocator, "{s}index.html", .{std.mem.trimStart(u8, page.url, "/")});
-        const out_path = try join(allocator, &.{ out_dir, rel });
-        try writeAll(allocator, out_path, final_html);
+        const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
+        try writeAll(allocator, route.out_path, final_html);
     }
 
-    try renderTagPages(allocator, out_dir, pages.items, site, head, runtime);
-    try renderArchivePage(allocator, out_dir, pages.items, site, head, runtime);
-    try writeAll(allocator, try join(allocator, &.{ out_dir, "rss.xml" }), try renderRss(allocator, pages.items, site));
-    try writeAll(allocator, try join(allocator, &.{ out_dir, "sitemap.xml" }), try renderSitemap(allocator, pages.items));
+    try renderTagPages(allocator, routes, pages.items, site, head, runtime);
+    try renderArchivePage(allocator, routes, pages.items, site, head, runtime);
+    const rss_route = routes.firstByKind(.rss) orelse return fail("missing RSS route", .{});
+    try writeAll(allocator, rss_route.out_path, try renderRss(allocator, pages.items, site));
+    const sitemap_route = routes.firstByKind(.sitemap) orelse return fail("missing sitemap route", .{});
+    try writeAll(allocator, sitemap_route.out_path, try renderSitemap(allocator, routes));
     try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
 }
 
@@ -630,12 +688,12 @@ fn addPrefetchPlaceholders(allocator: std.mem.Allocator, html: []const u8) ![]co
     return out.toOwnedSlice();
 }
 
-fn validatePages(allocator: std.mem.Allocator, pages: []Page) !void {
+fn validatePages(allocator: std.mem.Allocator, pages: []Page, routes: RouteGraph) !void {
     for (pages) |page| {
         if (page.fm.title.len == 0) return fail("missing .title in {s}", .{page.source_path});
         if (page.is_post and page.fm.date.len == 0) return fail("missing .date in post {s}", .{page.source_path});
         try validateDuplicateHeadings(allocator, page);
-        try validateInternalLinks(page, pages);
+        try validateInternalLinks(page, routes);
     }
 }
 
@@ -664,20 +722,111 @@ fn validateDuplicateHeadings(allocator: std.mem.Allocator, page: Page) !void {
     }
 }
 
-fn validateInternalLinks(page: Page, pages: []Page) !void {
+fn validateInternalLinks(page: Page, routes: RouteGraph) !void {
     var rest = page.markdown;
     while (std.mem.indexOf(u8, rest, "](")) |idx| {
         rest = rest[idx + 2 ..];
         const end = std.mem.indexOfScalar(u8, rest, ')') orelse break;
         const url = rest[0..end];
         if (std.mem.startsWith(u8, url, "/") and !std.mem.startsWith(u8, url, "//")) {
-            var ok = std.mem.eql(u8, url, "/rss.xml") or std.mem.eql(u8, url, "/sitemap.xml");
-            for (pages) |p| {
-                if (std.mem.eql(u8, p.url, url)) ok = true;
-            }
-            if (!ok) return fail("broken internal link '{s}' in {s}", .{ url, page.source_path });
+            if (!routes.containsUrl(url)) return fail("broken internal link '{s}' in {s}", .{ url, page.source_path });
         }
         rest = rest[end + 1 ..];
+    }
+}
+
+fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page) !RouteGraph {
+    var graph = RouteGraph.init(allocator);
+    errdefer graph.deinit();
+    const out_dir = try join(allocator, &.{ dir, site.out_dir });
+    defer allocator.free(out_dir);
+
+    for (pages) |page| {
+        if (page.fm.draft) continue;
+        const rel = try outputRelForUrl(allocator, page.url);
+        defer allocator.free(rel);
+        try graph.add(.{
+            .kind = if (page.is_post) .post else .page,
+            .source_path = page.source_path,
+            .url = page.url,
+            .out_path = try graph.own(try join(allocator, &.{ out_dir, rel })),
+        });
+    }
+
+    var seen_tags = std.StringHashMap(void).init(allocator);
+    defer seen_tags.deinit();
+    for (pages) |page| {
+        if (!page.is_post or page.fm.draft) continue;
+        for (page.fm.tags) |tag| {
+            const slug = try slugify(allocator, tag);
+            if (seen_tags.contains(slug)) {
+                allocator.free(slug);
+                continue;
+            }
+            seen_tags.put(slug, {}) catch |err| {
+                allocator.free(slug);
+                return err;
+            };
+            const owned_slug = try graph.own(slug);
+            try graph.add(.{
+                .kind = .tag,
+                .url = try graph.own(try std.fmt.allocPrint(allocator, "/tags/{s}/", .{owned_slug})),
+                .out_path = try graph.own(try join(allocator, &.{ out_dir, "tags", owned_slug, "index.html" })),
+            });
+        }
+    }
+
+    try graph.add(.{ .kind = .archive, .url = "/archive/", .out_path = try graph.own(try join(allocator, &.{ out_dir, "archive", "index.html" })) });
+    try graph.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "rss.xml" })) });
+    try graph.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "sitemap.xml" })) });
+
+    const static_dir = try join(allocator, &.{ dir, "static" });
+    defer allocator.free(static_dir);
+    var d = std.Io.Dir.cwd().openDir(runtime_io, static_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return graph,
+        else => return err,
+    };
+    defer d.close(runtime_io);
+    var it = d.iterate();
+    while (try it.next(runtime_io)) |entry| {
+        if (entry.kind != .file) continue;
+        try graph.add(.{
+            .kind = .static_asset,
+            .source_path = try graph.own(try join(allocator, &.{ static_dir, entry.name })),
+            .url = try graph.own(try std.fmt.allocPrint(allocator, "/{s}", .{entry.name})),
+            .out_path = try graph.own(try join(allocator, &.{ out_dir, entry.name })),
+        });
+    }
+
+    return graph;
+}
+
+fn outputRelForUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, url, "/")) return allocator.dupe(u8, "index.html");
+    if (std.mem.endsWith(u8, url, ".xml") or std.mem.endsWith(u8, url, ".json")) return allocator.dupe(u8, std.mem.trimStart(u8, url, "/"));
+    return std.fmt.allocPrint(allocator, "{s}index.html", .{std.mem.trimStart(u8, url, "/")});
+}
+
+fn findPageRoute(routes: RouteGraph, url: []const u8) ?Route {
+    for (routes.routes.items) |route| {
+        if ((route.kind == .page or route.kind == .post) and std.mem.eql(u8, route.url, url)) return route;
+    }
+    return null;
+}
+
+fn findRoute(routes: RouteGraph, kind: RouteKind, url: []const u8) ?Route {
+    for (routes.routes.items) |route| {
+        if (route.kind == kind and std.mem.eql(u8, route.url, url)) return route;
+    }
+    return null;
+}
+
+fn copyStaticRoutes(allocator: std.mem.Allocator, routes: RouteGraph) !void {
+    for (routes.routes.items) |route| {
+        if (route.kind != .static_asset) continue;
+        const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io, route.source_path, allocator, .limited(32 * 1024 * 1024));
+        defer allocator.free(data);
+        try writeAll(allocator, route.out_path, data);
     }
 }
 
@@ -755,33 +904,52 @@ fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const
     return out.toOwnedSlice();
 }
 
-fn renderTagPages(allocator: std.mem.Allocator, out_dir: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+fn renderTagPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     var seen = std.StringHashMap(void).init(allocator);
-    for (pages) |p| if (p.is_post and !p.fm.draft) for (p.fm.tags) |tag| {
-        const tag_slug = try slugify(allocator, tag);
-        if (seen.contains(tag_slug)) continue;
-        try seen.put(tag_slug, {});
-        var body = std.array_list.Managed(u8).init(allocator);
-        try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
-        for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
-            try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
-        };
-        try body.appendSlice("</ul>");
-        const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-        const layout = initBaseLayout;
-        const rendered = try renderLayout(allocator, layout, site, fake, try body.toOwnedSlice(), "", head, runtime);
-        try writeAll(allocator, try join(allocator, &.{ out_dir, "tags", tag_slug, "index.html" }), rendered);
-    };
+    defer {
+        var keys = seen.keyIterator();
+        while (keys.next()) |tag_slug| allocator.free(tag_slug.*);
+        seen.deinit();
+    }
+
+    for (pages) |p| {
+        if (!p.is_post or p.fm.draft) continue;
+        for (p.fm.tags) |tag| {
+            const tag_slug = try slugify(allocator, tag);
+            if (seen.contains(tag_slug)) {
+                allocator.free(tag_slug);
+                continue;
+            }
+            seen.put(tag_slug, {}) catch |err| {
+                allocator.free(tag_slug);
+                return err;
+            };
+            const tag_url = try std.fmt.allocPrint(allocator, "/tags/{s}/", .{tag_slug});
+            defer allocator.free(tag_url);
+            const route = findRoute(routes, .tag, tag_url) orelse return fail("missing tag route for {s}", .{tag_url});
+            var body = std.array_list.Managed(u8).init(allocator);
+            try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
+            for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
+                try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
+            };
+            try body.appendSlice("</ul>");
+            const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+            const layout = initBaseLayout;
+            const rendered = try renderLayout(allocator, layout, site, fake, try body.toOwnedSlice(), "", head, runtime);
+            try writeAll(allocator, route.out_path, rendered);
+        }
+    }
 }
 
-fn renderArchivePage(allocator: std.mem.Allocator, out_dir: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+fn renderArchivePage(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
     var body = std.array_list.Managed(u8).init(allocator);
     try body.appendSlice("<h1>Archive</h1>\n<ul>\n");
     for (pages) |p| if (p.is_post and !p.fm.draft) try body.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ p.fm.date, p.url, p.fm.title });
     try body.appendSlice("</ul>");
     const fake = Page{ .source_path = "", .slug = "archive", .url = "/archive/", .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
     const rendered = try renderLayout(allocator, initBaseLayout, site, fake, try body.toOwnedSlice(), "", head, runtime);
-    try writeAll(allocator, try join(allocator, &.{ out_dir, "archive", "index.html" }), rendered);
+    const route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
+    try writeAll(allocator, route.out_path, rendered);
 }
 
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
@@ -792,10 +960,13 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
     return out.toOwnedSlice();
 }
 
-fn renderSitemap(allocator: std.mem.Allocator, pages: []Page) ![]const u8 {
+fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     try out.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">");
-    for (pages) |p| if (!p.fm.draft) try out.print("<url><loc>{s}</loc></url>", .{p.url});
+    for (routes.routes.items) |route| switch (route.kind) {
+        .page, .post, .tag, .archive => try out.print("<url><loc>{s}</loc></url>", .{route.url}),
+        .rss, .sitemap, .static_asset => {},
+    };
     try out.appendSlice("</urlset>\n");
     return out.toOwnedSlice();
 }
@@ -897,22 +1068,6 @@ fn mkdirp(path: []const u8) !void {
 }
 fn writeNew(allocator: std.mem.Allocator, base: []const u8, rel: []const u8, text: []const u8) !void {
     try writeAll(allocator, try join(allocator, &.{ base, rel }), text);
-}
-
-fn copyStaticIfPresent(allocator: std.mem.Allocator, dir: []const u8, out_dir: []const u8) !void {
-    const static_dir = try join(allocator, &.{ dir, "static" });
-    var d = std.Io.Dir.cwd().openDir(runtime_io, static_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer d.close(runtime_io);
-    var it = d.iterate();
-    while (try it.next(runtime_io)) |entry| if (entry.kind == .file) {
-        const src = try join(allocator, &.{ static_dir, entry.name });
-        const dst = try join(allocator, &.{ out_dir, entry.name });
-        const data = try std.Io.Dir.cwd().readFileAlloc(runtime_io, src, allocator, .limited(32 * 1024 * 1024));
-        try writeAll(allocator, dst, data);
-    };
 }
 
 const initConfig =
@@ -1024,6 +1179,33 @@ test "draft pages are excluded from published outputs" {
     defer std.testing.allocator.free(rss);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Live") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Draft") == null);
+}
+
+test "route graph centralizes published routes and static assets" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/static");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/app.css", .data = "body{}" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false },
+        .{ .source_path = "content/posts/live.md", .slug = "live", .url = "/live/", .fm = .{ .title = "Live", .date = "2026-06-27", .tags = &[_][]const u8{"zig"} }, .markdown = "", .html = "", .is_post = true },
+        .{ .source_path = "content/posts/draft.md", .slug = "draft", .url = "/draft/", .fm = .{ .title = "Draft", .date = "2026-06-27", .draft = true }, .markdown = "", .html = "", .is_post = true },
+    };
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    try std.testing.expect(routes.containsUrl("/"));
+    try std.testing.expect(routes.containsUrl("/live/"));
+    try std.testing.expect(!routes.containsUrl("/draft/"));
+    try std.testing.expect(routes.containsUrl("/tags/zig/"));
+    try std.testing.expect(routes.containsUrl("/archive/"));
+    try std.testing.expect(routes.containsUrl("/rss.xml"));
+    try std.testing.expect(routes.containsUrl("/sitemap.xml"));
+    try std.testing.expect(routes.containsUrl("/app.css"));
 }
 
 test "markdown renderer emits headings paragraphs and links" {
