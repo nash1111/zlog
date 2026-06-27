@@ -9,9 +9,9 @@ Implemented now:
 - `zlog init [dir]` scaffold with `zlog.ziggy`, `content/index.md`, `content/posts/hello.md`, `layouts/base.shtml`, and `layouts/post.shtml`.
 - `zlog check [dir]` for config/frontmatter parsing, required title/date checks on posts, duplicate heading IDs, and broken internal Markdown links.
 - `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, cmark-gfm Markdown rendering, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
-- `zlog dev [dir] [port]` to rebuild once and serve the generated `public/` output on localhost.
+- `zlog dev [dir] [port]` to serve the generated `public/` output on localhost and rebuild when project files change.
 
-Not implemented yet: external SuperHTML integration, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
+Not implemented yet: external SuperHTML integration, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
 
 ## Build and test
 
@@ -37,6 +37,8 @@ zig build
 ```
 
 The generated site is written to `public/` by default.
+
+`zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
 ## Frontmatter
 

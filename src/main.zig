@@ -128,6 +128,7 @@ const RouteGraph = struct {
 
 const CliError = error{Usage};
 const default_dev_port: u16 = 1111;
+const watch_poll_interval_ms: i64 = 750;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
@@ -243,7 +244,98 @@ fn cmdDev(allocator: std.mem.Allocator, dir: []const u8, port: u16) !void {
     try cmdBuild(allocator, dir);
     const site = try loadSite(allocator, dir);
     const out_dir = try join(allocator, &.{ dir, site.out_dir });
+    try startDevWatcher(allocator, dir);
     try serveDirectory(allocator, out_dir, port);
+}
+
+fn startDevWatcher(allocator: std.mem.Allocator, dir: []const u8) !void {
+    var thread = try std.Thread.spawn(.{}, watchAndRebuild, .{ allocator, dir });
+    thread.detach();
+    try stdout("watching zlog.ziggy, content, layouts, and static for rebuilds\n", .{});
+}
+
+fn watchAndRebuild(allocator: std.mem.Allocator, dir: []const u8) void {
+    var site = loadSite(allocator, dir) catch SiteConfig{};
+    var previous = projectFingerprint(allocator, dir, site) catch |err| {
+        stderr("watch error: initial scan failed: {t}\n", .{err}) catch {};
+        return;
+    };
+
+    while (true) {
+        std.Io.Clock.Duration.sleep(.{ .raw = std.Io.Duration.fromMilliseconds(watch_poll_interval_ms), .clock = .boot }, runtime_io) catch return;
+
+        const next = projectFingerprint(allocator, dir, site) catch |err| {
+            stderr("watch error: scan failed: {t}\n", .{err}) catch {};
+            continue;
+        };
+        if (next == previous) continue;
+        previous = next;
+
+        stdout("change detected; rebuilding...\n", .{}) catch {};
+        cmdBuild(allocator, dir) catch |err| {
+            stderr("watch rebuild failed: {t}\n", .{err}) catch {};
+            continue;
+        };
+        site = loadSite(allocator, dir) catch site;
+        previous = projectFingerprint(allocator, dir, site) catch previous;
+        stdout("watch rebuild complete\n", .{}) catch {};
+    }
+}
+
+fn projectFingerprint(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    try fingerprintPath(allocator, try join(allocator, &.{ dir, "zlog.ziggy" }), &hasher);
+    try fingerprintPath(allocator, try join(allocator, &.{ dir, site.content_dir }), &hasher);
+    try fingerprintPath(allocator, try join(allocator, &.{ dir, site.layouts_dir }), &hasher);
+    try fingerprintPath(allocator, try join(allocator, &.{ dir, "static" }), &hasher);
+    return hasher.final();
+}
+
+fn fingerprintPath(allocator: std.mem.Allocator, path: []const u8, hasher: *std.hash.Wyhash) !void {
+    defer allocator.free(path);
+    hasher.update(path);
+    const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {
+            hasher.update("missing");
+            return;
+        },
+        else => return err,
+    };
+    hashFileStat(hasher, stat);
+    if (stat.kind != .directory) return;
+
+    var dir = std.Io.Dir.cwd().openDir(runtime_io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(runtime_io);
+
+    var names = std.array_list.Managed([]const u8).init(allocator);
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit();
+    }
+
+    var it = dir.iterate();
+    while (try it.next(runtime_io)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        try names.append(try allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]const u8, names.items, {}, stringLessThan);
+
+    for (names.items) |name| {
+        try fingerprintPath(allocator, try join(allocator, &.{ path, name }), hasher);
+    }
+}
+
+fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn hashFileStat(hasher: *std.hash.Wyhash, stat: std.Io.File.Stat) void {
+    hasher.update(@tagName(stat.kind));
+    hasher.update(std.mem.asBytes(&stat.size));
+    hasher.update(std.mem.asBytes(&stat.mtime.nanoseconds));
 }
 
 fn serveDirectory(allocator: std.mem.Allocator, root_dir: []const u8, port: u16) !void {
@@ -2100,6 +2192,21 @@ test "dev server resolves route paths into public files" {
     defer std.testing.allocator.free(asset);
     try std.testing.expectEqualStrings("public/app.css", asset);
     try std.testing.expectEqualStrings("text/css; charset=utf-8", contentTypeForPath(asset));
+}
+
+test "project fingerprint changes when watched inputs change" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/content");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/content/index.md", .data = "one" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const before = try projectFingerprint(std.testing.allocator, root, .{});
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/content/index.md", .data = "two two" });
+    const after = try projectFingerprint(std.testing.allocator, root, .{});
+    try std.testing.expect(before != after);
 }
 
 test "markdown renderer emits headings paragraphs and links" {
