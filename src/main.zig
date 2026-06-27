@@ -310,9 +310,13 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     try renderTagPages(allocator, routes, pages.items, site, head, runtime);
     try renderArchivePage(allocator, routes, pages.items, site, head, runtime);
     const rss_route = routes.firstByKind(.rss) orelse return fail("missing RSS route", .{});
-    try writeAll(allocator, rss_route.out_path, try renderRss(allocator, pages.items, site));
+    const rss_xml = try renderRss(allocator, pages.items, site);
+    defer allocator.free(rss_xml);
+    try writeAll(allocator, rss_route.out_path, rss_xml);
     const sitemap_route = routes.firstByKind(.sitemap) orelse return fail("missing sitemap route", .{});
-    try writeAll(allocator, sitemap_route.out_path, try renderSitemap(allocator, routes));
+    const sitemap_xml = try renderSitemap(allocator, routes, pages.items, site);
+    defer allocator.free(sitemap_xml);
+    try writeAll(allocator, sitemap_route.out_path, sitemap_xml);
     try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
 }
 
@@ -2258,15 +2262,94 @@ fn weekdayIndex(year: u16, month: u8, day: u8) usize {
     return @intCast(w);
 }
 
-fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph) ![]const u8 {
+fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
-    try out.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">");
-    for (routes.routes.items) |route| switch (route.kind) {
-        .page, .post, .tag, .archive => try out.print("<url><loc>{s}</loc></url>", .{route.url}),
-        .rss, .sitemap, .static_asset => {},
-    };
+    errdefer out.deinit();
+    try out.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+    for (routes.routes.items) |route| {
+        if (!includeInSitemap(route)) continue;
+        if (route.kind == .page or route.kind == .post) {
+            if (findPageByUrl(pages, route.url)) |page| {
+                if (page.fm.draft) continue;
+            } else continue;
+        }
+        const loc = try absoluteSiteUrl(allocator, site, route.url);
+        defer allocator.free(loc);
+        try out.appendSlice("<url>\n<loc>");
+        try appendXmlEscaped(&out, loc);
+        try out.appendSlice("</loc>\n");
+        if (try sitemapLastmod(allocator, route, pages)) |lastmod| {
+            try out.appendSlice("<lastmod>");
+            try appendXmlEscaped(&out, lastmod);
+            try out.appendSlice("</lastmod>\n");
+        }
+        try out.appendSlice("</url>\n");
+    }
     try out.appendSlice("</urlset>\n");
     return out.toOwnedSlice();
+}
+
+fn includeInSitemap(route: Route) bool {
+    return switch (route.kind) {
+        .page, .post, .tag, .archive => true,
+        .rss, .sitemap, .static_asset => false,
+    };
+}
+
+fn sitemapLastmod(allocator: std.mem.Allocator, route: Route, pages: []Page) !?[]const u8 {
+    return switch (route.kind) {
+        .page, .post => if (findPageByUrl(pages, route.url)) |page| reliablePageTimestamp(page) else null,
+        .archive => latestReliableTimestamp(pages),
+        .tag => try latestReliableTimestampForTagRoute(allocator, route.url, pages),
+        .rss, .sitemap, .static_asset => null,
+    };
+}
+
+fn reliablePageTimestamp(page: Page) ?[]const u8 {
+    const timestamp = if (page.fm.updated.len > 0) page.fm.updated else page.fm.date;
+    if (timestamp.len == 0 or parseIsoTimestamp(timestamp) == null) return null;
+    return timestamp;
+}
+
+fn latestReliableTimestamp(pages: []Page) ?[]const u8 {
+    var latest: ?[]const u8 = null;
+    for (pages) |page| {
+        if (!page.is_post or page.fm.draft) continue;
+        updateLatestTimestamp(&latest, reliablePageTimestamp(page));
+    }
+    return latest;
+}
+
+fn latestReliableTimestampForTagRoute(allocator: std.mem.Allocator, route_url: []const u8, pages: []Page) !?[]const u8 {
+    const route_slug = tagSlugFromRoute(route_url) orelse return null;
+    var latest: ?[]const u8 = null;
+    for (pages) |page| {
+        if (!page.is_post or page.fm.draft) continue;
+        if (!try pageHasTagSlug(allocator, page, route_slug)) continue;
+        updateLatestTimestamp(&latest, reliablePageTimestamp(page));
+    }
+    return latest;
+}
+
+fn tagSlugFromRoute(route_url: []const u8) ?[]const u8 {
+    const prefix = "/tags/";
+    if (!std.mem.startsWith(u8, route_url, prefix) or !std.mem.endsWith(u8, route_url, "/")) return null;
+    if (route_url.len <= prefix.len + 1) return null;
+    return route_url[prefix.len .. route_url.len - 1];
+}
+
+fn pageHasTagSlug(allocator: std.mem.Allocator, page: Page, route_slug: []const u8) !bool {
+    for (page.fm.tags) |tag| {
+        const slug = try slugify(allocator, tag);
+        defer allocator.free(slug);
+        if (std.mem.eql(u8, slug, route_slug)) return true;
+    }
+    return false;
+}
+
+fn updateLatestTimestamp(latest: *?[]const u8, candidate: ?[]const u8) void {
+    const timestamp = candidate orelse return;
+    if (latest.* == null or std.mem.order(u8, timestamp, latest.*.?) == .gt) latest.* = timestamp;
 }
 
 fn countPublishedPages(pages: []Page) usize {
@@ -2518,6 +2601,36 @@ test "rss date formatting converts iso timestamps" {
     const invalid_offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+99:00");
     defer std.testing.allocator.free(invalid_offset);
     try std.testing.expectEqualStrings("2026-06-23T00:00:00+99:00", invalid_offset);
+}
+
+test "sitemap output uses absolute urls and reliable lastmod" {
+    var pages = [_]Page{
+        .{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home", .date = "2026-06-20" }, .markdown = "", .html = "", .is_post = false },
+        .{ .source_path = "content/posts/live.md", .slug = "live", .url = "/live/", .fm = .{ .title = "Live", .date = "2026-06-27", .updated = "2026-06-28T00:00:00Z", .tags = &[_][]const u8{"zig"} }, .markdown = "", .html = "", .is_post = true },
+        .{ .source_path = "content/posts/draft.md", .slug = "draft", .url = "/draft/", .fm = .{ .title = "Draft", .date = "2026-06-29", .draft = true, .tags = &[_][]const u8{"zig"} }, .markdown = "", .html = "", .is_post = true },
+    };
+    var routes = RouteGraph.init(std.testing.allocator);
+    defer routes.deinit();
+    try routes.add(.{ .kind = .page, .url = "/", .out_path = "" });
+    try routes.add(.{ .kind = .post, .url = "/live/", .out_path = "" });
+    try routes.add(.{ .kind = .post, .url = "/draft/", .out_path = "" });
+    try routes.add(.{ .kind = .tag, .url = "/tags/zig/", .out_path = "" });
+    try routes.add(.{ .kind = .archive, .url = "/archive/", .out_path = "" });
+    try routes.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = "" });
+    try routes.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = "" });
+    try routes.add(.{ .kind = .static_asset, .url = "/app.css", .out_path = "" });
+
+    const sitemap = try renderSitemap(std.testing.allocator, routes, pages[0..], .{ .url = "https://example.com/blog/" });
+    defer std.testing.allocator.free(sitemap);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "<loc>https://example.com/blog/</loc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "<loc>https://example.com/blog/live/</loc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "<loc>https://example.com/blog/tags/zig/</loc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "<loc>https://example.com/blog/archive/</loc>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "<lastmod>2026-06-28T00:00:00Z</lastmod>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/draft/") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/rss.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/sitemap.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/app.css") == null);
 }
 
 test "route graph centralizes published routes and static assets" {
