@@ -1,0 +1,9 @@
+.title = "example.dev",
+.content_dir = "content",
+.layouts_dir = "layouts",
+.out_dir = "public",
+.navigation = .{
+  .prefetch_default = "hover",
+  .view_transition = "cross_document",
+  .speculation_rules = true,
+},
