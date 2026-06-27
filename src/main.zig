@@ -184,13 +184,15 @@ fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
         error.FileNotFound => return SiteConfig{},
         else => return err,
     };
+    const doc = try parseZiggyFields(allocator, text, path, 1);
+    defer allocator.free(doc.fields);
     return SiteConfig{
-        .title = parseStringField(text, "title") orelse "zlog site",
-        .content_dir = parseStringField(text, "content_dir") orelse "content",
-        .layouts_dir = parseStringField(text, "layouts_dir") orelse "layouts",
-        .out_dir = parseStringField(text, "out_dir") orelse "public",
-        .prefetch_default = parseStringField(text, "prefetch_default") orelse "hover",
-        .speculation_rules = parseBoolField(text, "speculation_rules") orelse true,
+        .title = try ziggyString(doc, path, "title", "zlog site"),
+        .content_dir = try ziggyString(doc, path, "content_dir", "content"),
+        .layouts_dir = try ziggyString(doc, path, "layouts_dir", "layouts"),
+        .out_dir = try ziggyString(doc, path, "out_dir", "public"),
+        .prefetch_default = try ziggyString(doc, path, "prefetch_default", "hover"),
+        .speculation_rules = try ziggyBool(doc, path, "speculation_rules", true),
     };
 }
 
@@ -229,7 +231,7 @@ fn walkMarkdown(allocator: std.mem.Allocator, root: []const u8, dir: []const u8,
 fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []const u8) !Page {
     const text = try std.Io.Dir.cwd().readFileAlloc(runtime_io, path, allocator, .limited(8 * 1024 * 1024));
     const split = splitFrontmatter(text);
-    const fm = try parseFrontmatter(allocator, split.frontmatter);
+    const fm = try parseFrontmatter(allocator, split.frontmatter, path, split.frontmatter_line);
     const rel = std.mem.trimStart(u8, path[content_root.len..], std.Io.Dir.path.sep_str);
     const is_post = std.mem.startsWith(u8, rel, "posts/");
     const slug = slugFromPath(rel);
@@ -238,78 +240,260 @@ fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []cons
     return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .html = html, .is_post = is_post };
 }
 
-const FrontmatterSplit = struct { frontmatter: []const u8, body: []const u8 };
+const FrontmatterSplit = struct {
+    frontmatter: []const u8,
+    body: []const u8,
+    frontmatter_line: usize,
+};
 
 fn splitFrontmatter(text: []const u8) FrontmatterSplit {
-    if (!std.mem.startsWith(u8, text, "---")) return .{ .frontmatter = "", .body = text };
+    if (!std.mem.startsWith(u8, text, "---")) return .{ .frontmatter = "", .body = text, .frontmatter_line = 1 };
     const rest = text[3..];
     if (std.mem.indexOf(u8, rest, "\n---")) |idx| {
         const body_start = 3 + idx + 4;
-        return .{ .frontmatter = std.mem.trim(u8, rest[0..idx], " \t\r\n"), .body = std.mem.trimStart(u8, text[body_start..], "\r\n") };
+        return .{ .frontmatter = std.mem.trim(u8, rest[0..idx], " \t\r\n"), .body = std.mem.trimStart(u8, text[body_start..], "\r\n"), .frontmatter_line = 2 };
     }
-    return .{ .frontmatter = "", .body = text };
+    return .{ .frontmatter = "", .body = text, .frontmatter_line = 1 };
 }
 
-fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8) !Frontmatter {
+fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize) !Frontmatter {
+    const doc = try parseZiggyFields(allocator, text, path, line_start);
+    defer allocator.free(doc.fields);
     return Frontmatter{
-        .title = parseStringField(text, "title") orelse "",
-        .date = parseStringField(text, "date") orelse "",
-        .layout = parseStringField(text, "layout") orelse "base.shtml",
-        .tags = try parseStringArrayField(allocator, text, "tags"),
-        .draft = parseBoolField(text, "draft") orelse false,
-        .prefetch = parseStringField(text, "prefetch") orelse "",
-        .transition = parseStringField(text, "transition") orelse "",
+        .title = try ziggyString(doc, path, "title", ""),
+        .date = try ziggyString(doc, path, "date", ""),
+        .layout = try ziggyString(doc, path, "layout", "base.shtml"),
+        .tags = try ziggyStringArray(doc, path, "tags"),
+        .draft = try ziggyBool(doc, path, "draft", false),
+        .prefetch = try ziggyString(doc, path, "prefetch", ""),
+        .transition = try ziggyString(doc, path, "transition", ""),
     };
 }
 
-fn parseStringField(text: []const u8, name: []const u8) ?[]const u8 {
-    const key = std.fmt.allocPrint(std.heap.page_allocator, ".{s}", .{name}) catch return null;
-    defer std.heap.page_allocator.free(key);
-    if (std.mem.indexOf(u8, text, key)) |start| {
-        const after_key = text[start + key.len ..];
-        const eq = std.mem.indexOfScalar(u8, after_key, '=') orelse return null;
-        const after_eq = std.mem.trimStart(u8, after_key[eq + 1 ..], " \t");
-        if (after_eq.len == 0 or after_eq[0] != '"') return null;
-        const rest = after_eq[1..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-        return rest[0..end];
-    }
-    return null;
-}
+const ZiggyValue = union(enum) {
+    string: []const u8,
+    bool: bool,
+    string_array: []const []const u8,
+    object,
+};
 
-fn parseBoolField(text: []const u8, name: []const u8) ?bool {
-    const key = std.fmt.allocPrint(std.heap.page_allocator, ".{s}", .{name}) catch return null;
-    defer std.heap.page_allocator.free(key);
-    if (std.mem.indexOf(u8, text, key)) |start| {
-        const after_key = text[start + key.len ..];
-        const eq = std.mem.indexOfScalar(u8, after_key, '=') orelse return null;
-        const value = std.mem.trimStart(u8, after_key[eq + 1 ..], " \t");
-        if (std.mem.startsWith(u8, value, "true")) return true;
-        if (std.mem.startsWith(u8, value, "false")) return false;
-    }
-    return null;
-}
+const ZiggyField = struct {
+    name: []const u8,
+    value: ZiggyValue,
+    line: usize,
+    column: usize,
+};
 
-fn parseStringArrayField(allocator: std.mem.Allocator, text: []const u8, name: []const u8) ![]const []const u8 {
-    const key = try std.fmt.allocPrint(allocator, ".{s}", .{name});
-    defer allocator.free(key);
-    if (std.mem.indexOf(u8, text, key)) |start| {
-        const after_key = text[start + key.len ..];
-        const eq = std.mem.indexOfScalar(u8, after_key, '=') orelse return &.{};
-        const after_eq = std.mem.trimStart(u8, after_key[eq + 1 ..], " \t");
-        if (after_eq.len == 0 or after_eq[0] != '[') return &.{};
-        const close = std.mem.indexOfScalar(u8, after_eq, ']') orelse return &.{};
-        var result = std.array_list.Managed([]const u8).init(allocator);
-        var rest = after_eq[1..close];
-        while (std.mem.indexOfScalar(u8, rest, '"')) |q1| {
-            rest = rest[q1 + 1 ..];
-            const q2 = std.mem.indexOfScalar(u8, rest, '"') orelse break;
-            try result.append(rest[0..q2]);
-            rest = rest[q2 + 1 ..];
+const ZiggyDoc = struct {
+    fields: []const ZiggyField,
+
+    fn find(self: ZiggyDoc, name: []const u8) ?ZiggyField {
+        var i = self.fields.len;
+        while (i > 0) {
+            i -= 1;
+            if (std.mem.eql(u8, self.fields[i].name, name)) return self.fields[i];
         }
-        return result.toOwnedSlice();
+        return null;
     }
-    return &.{};
+};
+
+fn parseZiggyFields(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize) !ZiggyDoc {
+    var parser = ZiggyParser{
+        .allocator = allocator,
+        .path = path,
+        .text = text,
+        .line = line_start,
+        .fields = std.array_list.Managed(ZiggyField).init(allocator),
+    };
+    while (true) {
+        try parser.skipIgnored();
+        if (parser.isDone()) break;
+        if (parser.peek() == '}') return parser.fail("unexpected object close", .{});
+        try parser.parseField();
+    }
+    return .{ .fields = try parser.fields.toOwnedSlice() };
+}
+
+const ZiggyParser = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    text: []const u8,
+    index: usize = 0,
+    line: usize = 1,
+    column: usize = 1,
+    fields: std.array_list.Managed(ZiggyField),
+
+    fn isDone(self: ZiggyParser) bool {
+        return self.index >= self.text.len;
+    }
+
+    fn peek(self: ZiggyParser) u8 {
+        return if (self.isDone()) 0 else self.text[self.index];
+    }
+
+    fn advance(self: *ZiggyParser) u8 {
+        const c = self.text[self.index];
+        self.index += 1;
+        if (c == '\n') {
+            self.line += 1;
+            self.column = 1;
+        } else {
+            self.column += 1;
+        }
+        return c;
+    }
+
+    fn fail(self: ZiggyParser, comptime fmt: []const u8, args: anytype) anyerror {
+        failAt(self.path, self.line, self.column, fmt, args) catch |err| return err;
+        return error.InvalidSite;
+    }
+
+    fn skipIgnored(self: *ZiggyParser) !void {
+        while (!self.isDone()) {
+            switch (self.peek()) {
+                ' ', '\t', '\r', '\n', ',' => _ = self.advance(),
+                '/' => {
+                    if (self.index + 1 < self.text.len and self.text[self.index + 1] == '/') {
+                        while (!self.isDone() and self.peek() != '\n') _ = self.advance();
+                    } else {
+                        return;
+                    }
+                },
+                else => return,
+            }
+        }
+    }
+
+    fn expect(self: *ZiggyParser, expected: u8) !void {
+        if (self.isDone() or self.peek() != expected) return self.fail("expected '{c}'", .{expected});
+        _ = self.advance();
+    }
+
+    fn parseField(self: *ZiggyParser) anyerror!void {
+        const field_line = self.line;
+        const field_column = self.column;
+        try self.expect('.');
+        const name = try self.parseIdentifier();
+        try self.skipIgnored();
+        try self.expect('=');
+        try self.skipIgnored();
+        const value = try self.parseValue();
+        try self.fields.append(.{ .name = name, .value = value, .line = field_line, .column = field_column });
+    }
+
+    fn parseIdentifier(self: *ZiggyParser) anyerror![]const u8 {
+        if (self.isDone() or !(std.ascii.isAlphabetic(self.peek()) or self.peek() == '_')) {
+            return self.fail("expected field name", .{});
+        }
+        const start = self.index;
+        while (!self.isDone() and (std.ascii.isAlphanumeric(self.peek()) or self.peek() == '_')) _ = self.advance();
+        return self.text[start..self.index];
+    }
+
+    fn parseValue(self: *ZiggyParser) anyerror!ZiggyValue {
+        return switch (self.peek()) {
+            '"' => .{ .string = try self.parseString() },
+            '[' => .{ .string_array = try self.parseStringArray() },
+            't', 'f' => .{ .bool = try self.parseBool() },
+            '.' => blk: {
+                _ = self.advance();
+                try self.expect('{');
+                while (true) {
+                    try self.skipIgnored();
+                    if (self.isDone()) return self.fail("unterminated object", .{});
+                    if (self.peek() == '}') {
+                        _ = self.advance();
+                        break;
+                    }
+                    try self.parseField();
+                }
+                break :blk .object;
+            },
+            else => self.fail("unsupported Ziggy value", .{}),
+        };
+    }
+
+    fn parseString(self: *ZiggyParser) anyerror![]const u8 {
+        try self.expect('"');
+        const start = self.index;
+        while (!self.isDone()) {
+            const c = self.peek();
+            if (c == '"') {
+                const value = self.text[start..self.index];
+                _ = self.advance();
+                return value;
+            }
+            if (c == '\n') return self.fail("unterminated string", .{});
+            if (c == '\\') {
+                _ = self.advance();
+                if (self.isDone()) return self.fail("unterminated escape sequence", .{});
+            }
+            _ = self.advance();
+        }
+        return self.fail("unterminated string", .{});
+    }
+
+    fn parseStringArray(self: *ZiggyParser) anyerror![]const []const u8 {
+        try self.expect('[');
+        var values = std.array_list.Managed([]const u8).init(self.allocator);
+        while (true) {
+            try self.skipIgnored();
+            if (self.isDone()) return self.fail("unterminated array", .{});
+            if (self.peek() == ']') {
+                _ = self.advance();
+                return values.toOwnedSlice();
+            }
+            if (self.peek() != '"') return self.fail("expected string in array", .{});
+            try values.append(try self.parseString());
+        }
+    }
+
+    fn parseBool(self: *ZiggyParser) anyerror!bool {
+        if (std.mem.startsWith(u8, self.text[self.index..], "true")) {
+            self.index += 4;
+            self.column += 4;
+            return true;
+        }
+        if (std.mem.startsWith(u8, self.text[self.index..], "false")) {
+            self.index += 5;
+            self.column += 5;
+            return false;
+        }
+        return self.fail("expected bool", .{});
+    }
+};
+
+fn ziggyString(doc: ZiggyDoc, path: []const u8, name: []const u8, default: []const u8) ![]const u8 {
+    const field = doc.find(name) orelse return default;
+    return switch (field.value) {
+        .string => |value| value,
+        else => {
+            try failAt(path, field.line, field.column, ".{s} must be a string", .{name});
+            unreachable;
+        },
+    };
+}
+
+fn ziggyBool(doc: ZiggyDoc, path: []const u8, name: []const u8, default: bool) !bool {
+    const field = doc.find(name) orelse return default;
+    return switch (field.value) {
+        .bool => |value| value,
+        else => {
+            try failAt(path, field.line, field.column, ".{s} must be a bool", .{name});
+            unreachable;
+        },
+    };
+}
+
+fn ziggyStringArray(doc: ZiggyDoc, path: []const u8, name: []const u8) ![]const []const u8 {
+    const field = doc.find(name) orelse return &.{};
+    return switch (field.value) {
+        .string_array => |value| value,
+        else => {
+            try failAt(path, field.line, field.column, ".{s} must be an array of strings", .{name});
+            unreachable;
+        },
+    };
 }
 
 fn markdownToHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]const u8 {
@@ -437,6 +621,11 @@ fn validatePages(allocator: std.mem.Allocator, pages: []Page) !void {
 
 fn fail(comptime fmt: []const u8, args: anytype) !void {
     try stderr("error: " ++ fmt ++ "\n", args);
+    return error.InvalidSite;
+}
+
+fn failAt(path: []const u8, line: usize, column: usize, comptime fmt: []const u8, args: anytype) !void {
+    try stderr("{s}:{d}:{d}: error: " ++ fmt ++ "\n", .{ path, line, column } ++ args);
     return error.InvalidSite;
 }
 
@@ -753,11 +942,26 @@ test "frontmatter parser reads title tags and draft" {
         \\.tags = ["zig", "ssg"],
         \\.draft = false,
     ;
-    const fm = try parseFrontmatter(std.testing.allocator, text);
+    const fm = try parseFrontmatter(std.testing.allocator, text, "post.md", 1);
     defer std.testing.allocator.free(fm.tags);
     try std.testing.expectEqualStrings("Post", fm.title);
     try std.testing.expectEqual(@as(usize, 2), fm.tags.len);
     try std.testing.expect(!fm.draft);
+}
+
+test "frontmatter parser rejects schema type mismatches" {
+    const text =
+        \\.title = "Post",
+        \\.tags = "zig",
+    ;
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1));
+}
+
+test "frontmatter parser reports malformed Ziggy syntax" {
+    const text =
+        \\.title = "Post
+    ;
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1));
 }
 
 test "markdown renderer emits headings paragraphs and links" {
