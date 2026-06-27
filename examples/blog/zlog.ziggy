@@ -1,4 +1,5 @@
 .title = "example.dev",
+.url = "https://example.dev",
 .content_dir = "content",
 .layouts_dir = "layouts",
 .out_dir = "public",

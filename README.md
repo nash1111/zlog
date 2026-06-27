@@ -40,6 +40,8 @@ zig build
 
 The generated site is written to `public/` by default.
 
+Set `.url` in `zlog.ziggy` to the canonical public URL for the site. RSS output uses this value for absolute channel, item, and GUID URLs.
+
 `zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
 ## Frontmatter
@@ -50,6 +52,7 @@ Ziggy-like frontmatter is supported for the MVP:
 ---
 .title = "Hello zlog",
 .date = "2026-06-23T00:00:00+09:00",
+.updated = "2026-06-24T00:00:00+09:00",
 .tags = ["zig", "ssg"],
 .layout = "post.shtml",
 .draft = false,

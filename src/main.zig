@@ -3,6 +3,7 @@ var runtime_io: std.Io = undefined;
 
 const SiteConfig = struct {
     title: []const u8 = "zlog site",
+    url: []const u8 = "http://localhost:1111",
     content_dir: []const u8 = "content",
     layouts_dir: []const u8 = "layouts",
     out_dir: []const u8 = "public",
@@ -13,6 +14,7 @@ const SiteConfig = struct {
 const Frontmatter = struct {
     title: []const u8 = "",
     date: []const u8 = "",
+    updated: []const u8 = "",
     layout: []const u8 = "base.shtml",
     tags: []const []const u8 = &.{},
     draft: bool = false,
@@ -623,6 +625,7 @@ fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
     defer allocator.free(doc.fields);
     return SiteConfig{
         .title = try ziggyString(doc, path, "title", "zlog site"),
+        .url = try ziggyString(doc, path, "url", "http://localhost:1111"),
         .content_dir = try ziggyString(doc, path, "content_dir", "content"),
         .layouts_dir = try ziggyString(doc, path, "layouts_dir", "layouts"),
         .out_dir = try ziggyString(doc, path, "out_dir", "public"),
@@ -701,6 +704,7 @@ fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []cons
     return Frontmatter{
         .title = try ziggyRequiredString(doc, path, line_start, "title"),
         .date = if (collection == .post) try ziggyRequiredString(doc, path, line_start, "date") else try ziggyString(doc, path, "date", ""),
+        .updated = try ziggyString(doc, path, "updated", ""),
         .layout = try ziggyString(doc, path, "layout", "base.shtml"),
         .tags = try ziggyStringArray(doc, path, "tags"),
         .draft = try ziggyBool(doc, path, "draft", false),
@@ -2087,10 +2091,171 @@ fn renderArchivePageHtml(allocator: std.mem.Allocator, pages: []Page, site: Site
 
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
-    try out.print("<?xml version=\"1.0\" encoding=\"utf-8\"?><rss version=\"2.0\"><channel><title>{s}</title>", .{site.title});
-    for (pages) |p| if (p.is_post and !p.fm.draft) try out.print("<item><title>{s}</title><link>{s}</link><pubDate>{s}</pubDate></item>", .{ p.fm.title, p.url, p.fm.date });
+    errdefer out.deinit();
+    const site_url = try absoluteSiteUrl(allocator, site, "/");
+    defer allocator.free(site_url);
+    const feed_url = try absoluteSiteUrl(allocator, site, "/rss.xml");
+    defer allocator.free(feed_url);
+
+    try out.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n<channel>\n<title>");
+    try appendXmlEscaped(&out, site.title);
+    try out.appendSlice("</title>\n<link>");
+    try appendXmlEscaped(&out, site_url);
+    try out.appendSlice("</link>\n<description>");
+    try appendXmlEscaped(&out, site.title);
+    try out.appendSlice("</description>\n<atom:link href=\"");
+    try appendXmlEscaped(&out, feed_url);
+    try out.appendSlice("\" rel=\"self\" type=\"application/rss+xml\" />\n");
+    if (latestRssTimestamp(pages)) |latest| {
+        const latest_date = try formatRssDate(allocator, latest);
+        defer allocator.free(latest_date);
+        try out.appendSlice("<lastBuildDate>");
+        try appendXmlEscaped(&out, latest_date);
+        try out.appendSlice("</lastBuildDate>\n");
+    }
+    for (pages) |p| if (p.is_post and !p.fm.draft) {
+        const item_url = try absoluteSiteUrl(allocator, site, p.url);
+        defer allocator.free(item_url);
+        const pub_date = try formatRssDate(allocator, p.fm.date);
+        defer allocator.free(pub_date);
+        try out.appendSlice("<item>\n<title>");
+        try appendXmlEscaped(&out, p.fm.title);
+        try out.appendSlice("</title>\n<link>");
+        try appendXmlEscaped(&out, item_url);
+        try out.appendSlice("</link>\n<guid isPermaLink=\"true\">");
+        try appendXmlEscaped(&out, item_url);
+        try out.appendSlice("</guid>\n<pubDate>");
+        try appendXmlEscaped(&out, pub_date);
+        try out.appendSlice("</pubDate>\n");
+        if (p.fm.updated.len > 0) {
+            try out.appendSlice("<dc:date>");
+            try appendXmlEscaped(&out, p.fm.updated);
+            try out.appendSlice("</dc:date>\n");
+        }
+        try out.appendSlice("<description>");
+        try appendXmlEscaped(&out, p.html);
+        try out.appendSlice("</description>\n</item>\n");
+    };
     try out.appendSlice("</channel></rss>\n");
     return out.toOwnedSlice();
+}
+
+fn absoluteSiteUrl(allocator: std.mem.Allocator, site: SiteConfig, path: []const u8) ![]const u8 {
+    if (hasUrlScheme(path)) return allocator.dupe(u8, path);
+    const base = std.mem.trimEnd(u8, site.url, "/");
+    if (std.mem.startsWith(u8, path, "/")) return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, path });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, path });
+}
+
+fn latestRssTimestamp(pages: []Page) ?[]const u8 {
+    var latest: ?[]const u8 = null;
+    for (pages) |p| {
+        if (!p.is_post or p.fm.draft) continue;
+        const timestamp = if (p.fm.updated.len > 0) p.fm.updated else p.fm.date;
+        if (timestamp.len == 0) continue;
+        if (latest == null or std.mem.order(u8, timestamp, latest.?) == .gt) latest = timestamp;
+    }
+    return latest;
+}
+
+const RssTimestamp = struct {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8 = 0,
+    minute: u8 = 0,
+    second: u8 = 0,
+    zone: [5]u8 = .{ '+', '0', '0', '0', '0' },
+};
+
+const rss_weekdays = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+const rss_months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+fn formatRssDate(allocator: std.mem.Allocator, timestamp: []const u8) ![]const u8 {
+    const parsed = parseIsoTimestamp(timestamp) orelse return allocator.dupe(u8, timestamp);
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}, {d:0>2} {s} {d:0>4} {d:0>2}:{d:0>2}:{d:0>2} {s}",
+        .{
+            rss_weekdays[weekdayIndex(parsed.year, parsed.month, parsed.day)],
+            parsed.day,
+            rss_months[parsed.month - 1],
+            parsed.year,
+            parsed.hour,
+            parsed.minute,
+            parsed.second,
+            parsed.zone[0..],
+        },
+    );
+}
+
+fn parseIsoTimestamp(timestamp: []const u8) ?RssTimestamp {
+    if (timestamp.len < 10) return null;
+    if (timestamp[4] != '-' or timestamp[7] != '-') return null;
+    var parsed = RssTimestamp{
+        .year = parseFixedInt(u16, timestamp[0..4]) catch return null,
+        .month = parseFixedInt(u8, timestamp[5..7]) catch return null,
+        .day = parseFixedInt(u8, timestamp[8..10]) catch return null,
+    };
+    if (!validDate(parsed.year, parsed.month, parsed.day)) return null;
+    if (timestamp.len == 10) return parsed;
+    if (timestamp[10] != 'T' and timestamp[10] != ' ') return null;
+    if (timestamp.len < 19) return null;
+    if (timestamp[13] != ':' or timestamp[16] != ':') return null;
+    parsed.hour = parseFixedInt(u8, timestamp[11..13]) catch return null;
+    parsed.minute = parseFixedInt(u8, timestamp[14..16]) catch return null;
+    parsed.second = parseFixedInt(u8, timestamp[17..19]) catch return null;
+    if (parsed.hour > 23 or parsed.minute > 59 or parsed.second > 60) return null;
+
+    var cursor: usize = 19;
+    if (cursor < timestamp.len and timestamp[cursor] == '.') {
+        cursor += 1;
+        const start = cursor;
+        while (cursor < timestamp.len and std.ascii.isDigit(timestamp[cursor])) cursor += 1;
+        if (cursor == start) return null;
+    }
+    if (cursor == timestamp.len) return parsed;
+    if (timestamp[cursor] == 'Z' and cursor + 1 == timestamp.len) return parsed;
+    if ((timestamp[cursor] == '+' or timestamp[cursor] == '-') and timestamp.len == cursor + 6 and timestamp[cursor + 3] == ':') {
+        const offset_hour = parseFixedInt(u8, timestamp[cursor + 1 .. cursor + 3]) catch return null;
+        const offset_minute = parseFixedInt(u8, timestamp[cursor + 4 .. cursor + 6]) catch return null;
+        if (offset_hour > 23 or offset_minute > 59) return null;
+        parsed.zone = .{ timestamp[cursor], timestamp[cursor + 1], timestamp[cursor + 2], timestamp[cursor + 4], timestamp[cursor + 5] };
+        return parsed;
+    }
+    return null;
+}
+
+fn parseFixedInt(comptime T: type, digits: []const u8) !T {
+    for (digits) |c| if (!std.ascii.isDigit(c)) return error.InvalidCharacter;
+    return std.fmt.parseInt(T, digits, 10);
+}
+
+fn validDate(year: u16, month: u8, day: u8) bool {
+    if (year == 0 or month == 0 or month > 12 or day == 0) return false;
+    return day <= daysInMonth(year, month);
+}
+
+fn daysInMonth(year: u16, month: u8) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
+}
+
+fn weekdayIndex(year: u16, month: u8, day: u8) usize {
+    const offsets = [_]i32{ 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    var y: i32 = @intCast(year);
+    const m: usize = @intCast(month);
+    if (m < 3) y -= 1;
+    const w = @mod(y + @divTrunc(y, 4) - @divTrunc(y, 100) + @divTrunc(y, 400) + offsets[m - 1] + @as(i32, @intCast(day)), 7);
+    return @intCast(w);
 }
 
 fn renderSitemap(allocator: std.mem.Allocator, routes: RouteGraph) ![]const u8 {
@@ -2149,6 +2314,11 @@ fn safeCssIdent(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
 fn appendEscaped(out: *std.array_list.Managed(u8), text: []const u8) !void {
     for (text) |c| try appendEscapedChar(out, c);
 }
+
+fn appendXmlEscaped(out: *std.array_list.Managed(u8), text: []const u8) !void {
+    try appendEscaped(out, text);
+}
+
 fn appendEscapedChar(out: *std.array_list.Managed(u8), c: u8) !void {
     switch (c) {
         '&' => try out.appendSlice("&amp;"),
@@ -2205,6 +2375,7 @@ fn writeNew(allocator: std.mem.Allocator, base: []const u8, rel: []const u8, tex
 
 const initConfig =
     \\.title = "example.dev",
+    \\.url = "https://example.dev",
     \\.content_dir = "content",
     \\.layouts_dir = "layouts",
     \\.out_dir = "public",
@@ -2312,6 +2483,41 @@ test "draft pages are excluded from published outputs" {
     defer std.testing.allocator.free(rss);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Live") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Draft") == null);
+}
+
+test "rss output uses absolute escaped item metadata" {
+    var pages = [_]Page{
+        .{ .source_path = "content/posts/live.md", .slug = "live", .url = "/live/", .fm = .{ .title = "A & B", .date = "2026-06-27T00:00:00Z", .updated = "2026-06-28T00:00:00Z" }, .markdown = "", .html = "<p>A & B</p>", .is_post = true },
+        .{ .source_path = "content/posts/draft.md", .slug = "draft", .url = "/draft/", .fm = .{ .title = "Draft", .date = "2026-06-27T00:00:00Z", .draft = true }, .markdown = "", .html = "", .is_post = true },
+    };
+    const rss = try renderRss(std.testing.allocator, pages[0..], .{ .title = "Site & Feed", .url = "https://example.com/blog/" });
+    defer std.testing.allocator.free(rss);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<link>https://example.com/blog/live/</link>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<guid isPermaLink=\"true\">https://example.com/blog/live/</guid>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<title>A &amp; B</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<pubDate>Sat, 27 Jun 2026 00:00:00 +0000</pubDate>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<lastBuildDate>Sun, 28 Jun 2026 00:00:00 +0000</lastBuildDate>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<description>&lt;p&gt;A &amp; B&lt;/p&gt;</description>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "<dc:date>2026-06-28T00:00:00Z</dc:date>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rss, "Draft") == null);
+}
+
+test "rss date formatting converts iso timestamps" {
+    const dated = try formatRssDate(std.testing.allocator, "2026-06-23");
+    defer std.testing.allocator.free(dated);
+    try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0000", dated);
+
+    const offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+09:00");
+    defer std.testing.allocator.free(offset);
+    try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0900", offset);
+
+    const unchanged = try formatRssDate(std.testing.allocator, "Tue, 23 Jun 2026 00:00:00 +0900");
+    defer std.testing.allocator.free(unchanged);
+    try std.testing.expectEqualStrings("Tue, 23 Jun 2026 00:00:00 +0900", unchanged);
+
+    const invalid_offset = try formatRssDate(std.testing.allocator, "2026-06-23T00:00:00+99:00");
+    defer std.testing.allocator.free(invalid_offset);
+    try std.testing.expectEqualStrings("2026-06-23T00:00:00+99:00", invalid_offset);
 }
 
 test "route graph centralizes published routes and static assets" {
