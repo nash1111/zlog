@@ -25,6 +25,26 @@ zig build release-local
 
 Release archive naming is documented in `docs/releases.md`.
 
+## Continuous Integration
+
+Pull requests run the GitHub Actions workflow in `.github/workflows/ci.yml`. It
+installs the cmark-gfm development packages, sets up Zig 0.16.0, then runs
+formatting, tests, a build, and example-site check/build commands.
+
+Most CI failures can be reproduced locally with:
+
+```bash
+zig fmt --check build.zig src/main.zig test/cli_integration.zig
+zig build test
+zig build
+./zig-out/bin/zlog check examples/blog
+./zig-out/bin/zlog build examples/blog
+./zig-out/bin/zlog check examples/docs
+./zig-out/bin/zlog build examples/docs
+./zig-out/bin/zlog check examples/portfolio
+./zig-out/bin/zlog build examples/portfolio
+```
+
 ## Quickstart
 
 ```bash
