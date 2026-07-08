@@ -210,6 +210,8 @@ Layouts are HTML files under the configured `layouts_dir`. They use explicit
 - `z-attr:name="binding"` writes an escaped attribute when the binding is not
   empty.
 - `z-replace="page.taxonomies"` inserts links for tags, categories, and series.
+- `z-replace="page.toc"` inserts a nested table of contents generated from
+  Markdown headings.
 - `z-replace="pagination"` inserts generated pagination navigation when a
   listing spans multiple pages.
 
@@ -219,10 +221,10 @@ nested includes are expanded before HTML validation.
 
 Supported bindings include `site.title`, `site.url`, `site.language`,
 `site.timezone`, `site.author`, `page.title`, `page.full_title`, `page.date`,
-`page.transition`, `page.tags`, `page.taxonomies`, `content`, `post_list`,
-`pagination`, `pagination.current`, `pagination.total`,
-`pagination.previous_url`, `pagination.next_url`, `zlog.head`, and
-`zlog.runtime`.
+`page.transition`, `page.tags`, `page.taxonomies`, `page.toc`, `toc`,
+`content`, `post_list`, `pagination`, `pagination.current`,
+`pagination.total`, `pagination.previous_url`, `pagination.next_url`,
+`zlog.head`, and `zlog.runtime`.
 
 The renderer validates layout structure and rejects legacy `{{...}}` tokens.
 `zlog check` also validates rendered HTML and rejects duplicate

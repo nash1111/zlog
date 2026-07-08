@@ -96,6 +96,7 @@ const Page = struct {
     markdown: []const u8,
     body_line: usize = 1,
     html: []const u8,
+    headings: []const Heading = &.{},
     is_post: bool,
 };
 
@@ -1106,8 +1107,8 @@ fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []cons
         try renderPostPermalink(allocator, site.permalink, slug, fm.date, path, split.frontmatter_line)
     else
         try std.fmt.allocPrint(allocator, "/{s}/", .{slug});
-    const html = try markdownToHtml(allocator, split.body);
-    return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .body_line = split.body_line, .html = html, .is_post = is_post };
+    const rendered = try markdownToHtmlWithHeadings(allocator, split.body);
+    return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .body_line = split.body_line, .html = rendered.html, .headings = rendered.headings, .is_post = is_post };
 }
 
 const FrontmatterSplit = struct {
@@ -1641,10 +1642,21 @@ fn ziggyStringArray(doc: ZiggyDoc, path: []const u8, name: []const u8) ![]const 
     };
 }
 
+const RenderedMarkdown = struct {
+    html: []const u8,
+    headings: []const Heading,
+};
+
 fn markdownToHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]const u8 {
+    const rendered = try markdownToHtmlWithHeadings(allocator, markdown);
+    freeHeadingSlice(allocator, rendered.headings);
+    return rendered.html;
+}
+
+fn markdownToHtmlWithHeadings(allocator: std.mem.Allocator, markdown: []const u8) !RenderedMarkdown {
     const options: c_int = CMARK_OPT_VALIDATE_UTF8 | CMARK_OPT_FOOTNOTES | CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE | CMARK_OPT_TABLE_PREFER_STYLE_ATTRIBUTES;
     var headings = std.array_list.Managed(Heading).init(allocator);
-    defer freeHeadings(allocator, &headings);
+    errdefer freeHeadings(allocator, &headings);
 
     cmark.cmark_gfm_core_extensions_ensure_registered();
     const parser = cmark.cmark_parser_new(options) orelse return error.MarkdownParserUnavailable;
@@ -1666,7 +1678,10 @@ fn markdownToHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]const u
     defer allocator.free(with_heading_ids);
     const with_code_highlighting = try enhanceCodeBlocks(allocator, with_heading_ids);
     defer allocator.free(with_code_highlighting);
-    return addPrefetchPlaceholders(allocator, with_code_highlighting);
+    const html = try addPrefetchPlaceholders(allocator, with_code_highlighting);
+    errdefer allocator.free(html);
+    const owned_headings = try headings.toOwnedSlice();
+    return .{ .html = html, .headings = owned_headings };
 }
 
 fn attachCmarkExtensions(parser: *cmark.parser) !void {
@@ -1893,11 +1908,20 @@ fn collectCmarkHeadings(allocator: std.mem.Allocator, root: *cmark.node, heading
 }
 
 fn freeHeadings(allocator: std.mem.Allocator, headings: *std.array_list.Managed(Heading)) void {
-    for (headings.items) |heading| {
+    freeHeadingValues(allocator, headings.items);
+    headings.deinit();
+}
+
+fn freeHeadingSlice(allocator: std.mem.Allocator, headings: []const Heading) void {
+    freeHeadingValues(allocator, headings);
+    allocator.free(headings);
+}
+
+fn freeHeadingValues(allocator: std.mem.Allocator, headings: []const Heading) void {
+    for (headings) |heading| {
         allocator.free(heading.id);
         allocator.free(heading.title);
     }
-    headings.deinit();
 }
 
 fn addHeadingIdsToHtml(allocator: std.mem.Allocator, html: []const u8, headings: []const Heading) ![]const u8 {
@@ -2501,6 +2525,7 @@ const TemplateContext = struct {
     runtime: []const u8,
     page_tags: []const u8,
     page_taxonomies: []const u8,
+    page_toc: []const u8,
     page_full_title: []const u8,
     pagination_nav: []const u8,
     pagination_current: []const u8,
@@ -2555,6 +2580,8 @@ fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: [
     defer allocator.free(page_tags);
     const page_taxonomies = try renderTaxonomiesInline(allocator, page);
     defer allocator.free(page_taxonomies);
+    const page_toc = try renderTableOfContents(allocator, page.headings);
+    defer allocator.free(page_toc);
     const page_full_title = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ page.fm.title, site.title });
     defer allocator.free(page_full_title);
     const pagination_nav = try renderPaginationNav(allocator, pagination);
@@ -2572,6 +2599,7 @@ fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: [
         .runtime = runtime,
         .page_tags = page_tags,
         .page_taxonomies = page_taxonomies,
+        .page_toc = page_toc,
         .page_full_title = page_full_title,
         .pagination_nav = pagination_nav,
         .pagination_current = pagination_current,
@@ -2685,6 +2713,7 @@ fn templateValue(ctx: TemplateContext, expr: []const u8, layout_path: []const u8
     if (std.mem.eql(u8, name, "page.transition")) return ctx.page.fm.transition;
     if (std.mem.eql(u8, name, "page.tags")) return ctx.page_tags;
     if (std.mem.eql(u8, name, "page.taxonomies")) return ctx.page_taxonomies;
+    if (std.mem.eql(u8, name, "page.toc") or std.mem.eql(u8, name, "toc")) return ctx.page_toc;
     if (std.mem.eql(u8, name, "content")) return ctx.content;
     if (std.mem.eql(u8, name, "post_list")) return ctx.post_list;
     if (std.mem.eql(u8, name, "zlog.head")) return ctx.head;
@@ -3029,6 +3058,45 @@ fn renderTaxonomiesInline(allocator: std.mem.Allocator, page: Page) ![]const u8 
         try out.appendSlice("</span>");
     }
     return out.toOwnedSlice();
+}
+
+fn renderTableOfContents(allocator: std.mem.Allocator, headings: []const Heading) ![]const u8 {
+    if (headings.len == 0) return allocator.dupe(u8, "");
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("<nav class=\"zlog-toc\" aria-label=\"Table of contents\">");
+
+    const base_level = normalizedHeadingLevel(headings[0].level);
+    var current_level: usize = 0;
+    var first = true;
+    for (headings) |heading| {
+        const actual_level = normalizedHeadingLevel(heading.level);
+        const level = if (first) base_level else @min(@max(actual_level, base_level), current_level + 1);
+        if (first) {
+            try out.appendSlice("<ol>");
+            current_level = level;
+            first = false;
+        } else if (level > current_level) {
+            while (current_level < level) : (current_level += 1) try out.appendSlice("<ol>");
+        } else {
+            while (current_level > level) : (current_level -= 1) try out.appendSlice("</li></ol>");
+            try out.appendSlice("</li>");
+        }
+
+        try out.print("<li data-level=\"{d}\"><a href=\"#", .{actual_level});
+        try appendEscaped(&out, heading.id);
+        try out.appendSlice("\">");
+        try appendEscaped(&out, heading.title);
+        try out.appendSlice("</a>");
+    }
+
+    while (current_level >= base_level and current_level > 0) : (current_level -= 1) try out.appendSlice("</li></ol>");
+    try out.appendSlice("</nav>");
+    return out.toOwnedSlice();
+}
+
+fn normalizedHeadingLevel(level: usize) usize {
+    return std.math.clamp(level, 1, 6);
 }
 
 fn renderHead(allocator: std.mem.Allocator, site: SiteConfig, routes: RouteGraph) ![]const u8 {
@@ -4698,6 +4766,35 @@ test "template renderer applies attributes and raw slots" {
     try std.testing.expect(std.mem.indexOf(u8, html, "z-replace") == null);
 }
 
+test "template renderer exposes generated table of contents" {
+    const page = Page{
+        .source_path = "content/posts/post.md",
+        .slug = "post",
+        .url = "/post/",
+        .fm = .{ .title = "Post", .date = "2026-06-27" },
+        .markdown = "",
+        .html = "",
+        .headings = &[_]Heading{
+            .{ .level = 2, .id = "intro", .title = "Intro" },
+            .{ .level = 3, .id = "details", .title = "Details" },
+        },
+        .is_post = true,
+    };
+    const layout =
+        \\<html><head><title z-text="page.full_title"></title></head><body>
+        \\<template z-replace="page.toc"></template>
+        \\<main><template z-replace="content"></template></main>
+        \\</body></html>
+    ;
+    const html = try renderLayout(std.testing.allocator, layout, "<test layout>", .{ .title = "Example" }, page, "<p>Body</p>", "", "", "", .{});
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"zlog-toc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-level=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "href=\"#intro\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-level=\"3\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "href=\"#details\"") != null);
+}
+
 test "layout partials are included before bindings render" {
     runtime_io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -4826,6 +4923,7 @@ test "template renderer rejects invalid structure and legacy tokens" {
         .runtime = "",
         .page_tags = "",
         .page_taxonomies = "",
+        .page_toc = "",
         .page_full_title = "Home - zlog site",
         .pagination_nav = "",
         .pagination_current = "1",
@@ -4936,6 +5034,38 @@ test "markdown renderer emits headings paragraphs and links" {
     defer std.testing.allocator.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "<h1 id=\"hello\">Hello</h1>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "data-z-prefetch") != null);
+}
+
+test "markdown renderer returns heading data for table of contents" {
+    const rendered = try markdownToHtmlWithHeadings(std.testing.allocator,
+        \\## Intro
+        \\
+        \\### Details
+    );
+    defer std.testing.allocator.free(rendered.html);
+    defer freeHeadingSlice(std.testing.allocator, rendered.headings);
+    try std.testing.expectEqual(@as(usize, 2), rendered.headings.len);
+    try std.testing.expectEqual(@as(usize, 2), rendered.headings[0].level);
+    try std.testing.expectEqualStrings("intro", rendered.headings[0].id);
+    try std.testing.expectEqualStrings("Intro", rendered.headings[0].title);
+    try std.testing.expectEqual(@as(usize, 3), rendered.headings[1].level);
+    try std.testing.expectEqualStrings("details", rendered.headings[1].id);
+    const toc = try renderTableOfContents(std.testing.allocator, rendered.headings);
+    defer std.testing.allocator.free(toc);
+    try std.testing.expect(std.mem.indexOf(u8, toc, "<ol><li data-level=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toc, "<ol><li data-level=\"3\"") != null);
+}
+
+test "table of contents preserves skipped heading levels without empty lists" {
+    const headings = [_]Heading{
+        .{ .level = 2, .id = "overview", .title = "Overview" },
+        .{ .level = 4, .id = "details", .title = "Details" },
+    };
+    const toc = try renderTableOfContents(std.testing.allocator, &headings);
+    defer std.testing.allocator.free(toc);
+    try std.testing.expect(std.mem.indexOf(u8, toc, "<ol><ol>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, toc, "data-level=\"4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, toc, "href=\"#details\"") != null);
 }
 
 test "markdown renderer handles fenced code tables and emphasis" {
