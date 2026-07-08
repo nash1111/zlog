@@ -1264,23 +1264,40 @@ fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConf
 
     const static_dir = try join(allocator, &.{ dir, "static" });
     defer allocator.free(static_dir);
-    var d = std.Io.Dir.cwd().openDir(runtime_io, static_dir, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return graph,
+    try addStaticRoutes(allocator, &graph, static_dir, out_dir, "");
+
+    return graph;
+}
+
+fn addStaticRoutes(allocator: std.mem.Allocator, graph: *RouteGraph, static_dir: []const u8, out_dir: []const u8, rel_dir: []const u8) !void {
+    const current_dir = if (rel_dir.len == 0) try allocator.dupe(u8, static_dir) else try join(allocator, &.{ static_dir, rel_dir });
+    defer allocator.free(current_dir);
+
+    var d = std.Io.Dir.cwd().openDir(runtime_io, current_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
         else => return err,
     };
     defer d.close(runtime_io);
+
     var it = d.iterate();
     while (try it.next(runtime_io)) |entry| {
-        if (entry.kind != .file) continue;
-        try graph.add(.{
-            .kind = .static_asset,
-            .source_path = try graph.own(try join(allocator, &.{ static_dir, entry.name })),
-            .url = try graph.own(try std.fmt.allocPrint(allocator, "/{s}", .{entry.name})),
-            .out_path = try graph.own(try join(allocator, &.{ out_dir, entry.name })),
-        });
-    }
+        const rel_path = if (rel_dir.len == 0)
+            try allocator.dupe(u8, entry.name)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_dir, entry.name });
+        defer allocator.free(rel_path);
 
-    return graph;
+        switch (entry.kind) {
+            .file => try graph.add(.{
+                .kind = .static_asset,
+                .source_path = try graph.own(try join(allocator, &.{ static_dir, rel_path })),
+                .url = try graph.own(try std.fmt.allocPrint(allocator, "/{s}", .{rel_path})),
+                .out_path = try graph.own(try join(allocator, &.{ out_dir, rel_path })),
+            }),
+            .directory => try addStaticRoutes(allocator, graph, static_dir, out_dir, rel_path),
+            else => {},
+        }
+    }
 }
 
 fn outputRelForUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
@@ -2024,8 +2041,9 @@ test "route graph centralizes published routes and static assets" {
     runtime_io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "site/static");
+    try tmp.dir.createDirPath(std.testing.io, "site/static/assets/icons");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/app.css", .data = "body{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/assets/icons/logo.bin", .data = &.{ 0x00, 0xff, 0x42 } });
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
 
@@ -2045,6 +2063,28 @@ test "route graph centralizes published routes and static assets" {
     try std.testing.expect(routes.containsUrl("/rss.xml"));
     try std.testing.expect(routes.containsUrl("/sitemap.xml"));
     try std.testing.expect(routes.containsUrl("/app.css"));
+    try std.testing.expect(routes.containsUrl("/assets/icons/logo.bin"));
+}
+
+test "static assets are copied recursively without changing bytes" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/static/assets/icons");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/assets/icons/logo.bin", .data = &.{ 0x00, 0xff, 0x42, 0x7f } });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, &.{});
+    defer routes.deinit();
+    try std.testing.expect(routes.containsUrl("/assets/icons/logo.bin"));
+    try copyStaticRoutes(std.testing.allocator, routes);
+
+    const copied_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/public/assets/icons/logo.bin", .{root});
+    defer std.testing.allocator.free(copied_path);
+    const copied = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, copied_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0x42, 0x7f }, copied);
 }
 
 test "internal link validation resolves anchors route variants relative links and assets" {
