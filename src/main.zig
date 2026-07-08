@@ -7,6 +7,7 @@ const SiteConfig = struct {
     language: []const u8 = "en",
     timezone: []const u8 = "UTC",
     author: []const u8 = "",
+    permalink: []const u8 = "/:slug/",
     content_dir: []const u8 = "content",
     layouts_dir: []const u8 = "layouts",
     out_dir: []const u8 = "public",
@@ -16,6 +17,7 @@ const SiteConfig = struct {
 
 const Frontmatter = struct {
     title: []const u8 = "",
+    slug: []const u8 = "",
     date: []const u8 = "",
     updated: []const u8 = "",
     layout: []const u8 = "base.shtml",
@@ -638,6 +640,7 @@ fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
         .language = try ziggyString(doc, path, "language", "en"),
         .timezone = try ziggyString(doc, path, "timezone", "UTC"),
         .author = try ziggyString(doc, path, "author", ""),
+        .permalink = try ziggyString(doc, path, "permalink", "/:slug/"),
         .content_dir = try ziggyString(doc, path, "content_dir", "content"),
         .layouts_dir = try ziggyString(doc, path, "layouts_dir", "layouts"),
         .out_dir = try ziggyString(doc, path, "out_dir", "public"),
@@ -653,6 +656,7 @@ fn validateSiteConfig(site: SiteConfig, path: []const u8) !void {
     if (!validLanguageTag(site.language)) return failAtHint(path, 1, 1, "invalid language tag '{s}'", .{site.language}, "Use a BCP47-style language tag such as en or en-US.");
     if (!validTimezone(site.timezone)) return failAtHint(path, 1, 1, "invalid timezone '{s}'", .{site.timezone}, "Use UTC, an offset such as +09:00, or an IANA-style name such as Asia/Tokyo.");
     if (!validAuthor(site.author)) return failAtHint(path, 1, 1, "invalid author value", .{}, "Keep .author to a single line without control characters.");
+    if (!validPermalinkPattern(site.permalink)) return failAtHint(path, 1, 1, "invalid permalink pattern '{s}'", .{site.permalink}, "Use a pattern such as /:slug/ or /posts/:year/:month/:slug/.");
 }
 
 fn validSiteUrl(url: []const u8) bool {
@@ -707,10 +711,48 @@ fn validAuthor(author: []const u8) bool {
     return true;
 }
 
+fn validPermalinkPattern(pattern: []const u8) bool {
+    if (pattern.len < 2 or pattern[0] != '/' or pattern[pattern.len - 1] != '/') return false;
+    var has_slug = false;
+    var previous_slash = false;
+    var segment_start: usize = 1;
+    var i: usize = 0;
+    while (i < pattern.len) {
+        const c = pattern[i];
+        if (std.ascii.isWhitespace(c)) return false;
+        if (c == '/') {
+            if (previous_slash) return false;
+            if (i > segment_start and std.mem.eql(u8, pattern[segment_start..i], "..")) return false;
+            previous_slash = true;
+            segment_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if (c != ':') {
+            if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
+            previous_slash = false;
+            i += 1;
+            continue;
+        }
+        i += 1;
+        const start = i;
+        while (i < pattern.len and (std.ascii.isAlphabetic(pattern[i]) or pattern[i] == '_')) i += 1;
+        if (i == start) return false;
+        const token = pattern[start..i];
+        if (std.mem.eql(u8, token, "slug")) {
+            has_slug = true;
+        } else if (!(std.mem.eql(u8, token, "year") or std.mem.eql(u8, token, "month") or std.mem.eql(u8, token, "day"))) {
+            return false;
+        }
+        previous_slash = false;
+    }
+    return has_slug;
+}
+
 fn loadPages(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !std.array_list.Managed(Page) {
     var pages = std.array_list.Managed(Page).init(allocator);
     const content_root = try join(allocator, &.{ dir, site.content_dir });
-    try walkMarkdown(allocator, content_root, content_root, &pages);
+    try walkMarkdown(allocator, content_root, content_root, site, &pages);
     std.mem.sort(Page, pages.items, {}, pageLessThan);
     return pages;
 }
@@ -720,7 +762,7 @@ fn pageLessThan(_: void, a: Page, b: Page) bool {
     return std.mem.order(u8, b.fm.date, a.fm.date) == .lt;
 }
 
-fn walkMarkdown(allocator: std.mem.Allocator, root: []const u8, dir: []const u8, pages: *std.array_list.Managed(Page)) !void {
+fn walkMarkdown(allocator: std.mem.Allocator, root: []const u8, dir: []const u8, site: SiteConfig, pages: *std.array_list.Managed(Page)) !void {
     var d = std.Io.Dir.cwd().openDir(runtime_io, dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
@@ -730,23 +772,33 @@ fn walkMarkdown(allocator: std.mem.Allocator, root: []const u8, dir: []const u8,
     while (try it.next(runtime_io)) |entry| {
         const child = try join(allocator, &.{ dir, entry.name });
         switch (entry.kind) {
-            .directory => try walkMarkdown(allocator, root, child, pages),
+            .directory => try walkMarkdown(allocator, root, child, site, pages),
             .file => if (std.mem.endsWith(u8, entry.name, ".md")) {
-                try pages.append(try loadPage(allocator, root, child));
+                try pages.append(try loadPage(allocator, root, child, site));
             },
             else => {},
         }
     }
 }
 
-fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []const u8) !Page {
+fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []const u8, site: SiteConfig) !Page {
     const text = try std.Io.Dir.cwd().readFileAlloc(runtime_io, path, allocator, .limited(8 * 1024 * 1024));
     const split = splitFrontmatter(text);
     const rel = std.mem.trimStart(u8, path[content_root.len..], std.Io.Dir.path.sep_str);
     const is_post = std.mem.startsWith(u8, rel, "posts/");
     const fm = try parseFrontmatter(allocator, split.frontmatter, path, split.frontmatter_line, if (is_post) .post else .page);
-    const slug = slugFromPath(rel);
-    const url = if (std.mem.eql(u8, rel, "index.md")) try allocator.dupe(u8, "/") else try std.fmt.allocPrint(allocator, "/{s}/", .{slug});
+    const path_slug = slugFromPath(rel);
+    const slug = if (fm.slug.len > 0) fm.slug else path_slug;
+    if (fm.slug.len > 0 and !validSlugPath(fm.slug)) {
+        try failAtHint(path, split.frontmatter_line, 1, "invalid custom slug '{s}'", .{fm.slug}, "Use URL path segments without whitespace, leading slash, trailing slash, or '..'.");
+        unreachable;
+    }
+    const url = if (std.mem.eql(u8, rel, "index.md"))
+        try allocator.dupe(u8, "/")
+    else if (is_post)
+        try renderPostPermalink(allocator, site.permalink, slug, fm.date, path, split.frontmatter_line)
+    else
+        try std.fmt.allocPrint(allocator, "/{s}/", .{slug});
     const html = try markdownToHtml(allocator, split.body);
     return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .body_line = split.body_line, .html = html, .is_post = is_post };
 }
@@ -776,6 +828,7 @@ fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []cons
     defer allocator.free(doc.fields);
     return Frontmatter{
         .title = try ziggyRequiredString(doc, path, line_start, "title"),
+        .slug = try ziggyString(doc, path, "slug", ""),
         .date = if (collection == .post) try ziggyRequiredString(doc, path, line_start, "date") else try ziggyString(doc, path, "date", ""),
         .updated = try ziggyString(doc, path, "updated", ""),
         .layout = try ziggyString(doc, path, "layout", "base.shtml"),
@@ -2496,6 +2549,76 @@ fn slugFromPath(rel: []const u8) []const u8 {
     return out;
 }
 
+const DateParts = struct {
+    year: []const u8,
+    month: []const u8,
+    day: []const u8,
+};
+
+fn renderPostPermalink(allocator: std.mem.Allocator, pattern: []const u8, slug: []const u8, date: []const u8, path: []const u8, line: usize) ![]const u8 {
+    if (!validSlugPath(slug)) {
+        try failAtHint(path, line, 1, "invalid post slug '{s}'", .{slug}, "Use URL path segments without whitespace, leading slash, trailing slash, or '..'.");
+        unreachable;
+    }
+    const parts = dateParts(date);
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < pattern.len) {
+        if (pattern[i] != ':') {
+            try out.append(pattern[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        const start = i;
+        while (i < pattern.len and (std.ascii.isAlphabetic(pattern[i]) or pattern[i] == '_')) i += 1;
+        const token = pattern[start..i];
+        if (std.mem.eql(u8, token, "slug")) {
+            try out.appendSlice(slug);
+        } else {
+            const parsed = parts orelse {
+                try failAtHint(path, line, 1, "post date '{s}' cannot be used in permalink pattern '{s}'", .{ date, pattern }, "Use an ISO-style date such as 2026-06-23 or remove date placeholders from .permalink.");
+                unreachable;
+            };
+            if (std.mem.eql(u8, token, "year")) {
+                try out.appendSlice(parsed.year);
+            } else if (std.mem.eql(u8, token, "month")) {
+                try out.appendSlice(parsed.month);
+            } else if (std.mem.eql(u8, token, "day")) {
+                try out.appendSlice(parsed.day);
+            } else {
+                try failAtHint(path, line, 1, "unknown permalink placeholder ':{s}'", .{token}, "Supported placeholders are :slug, :year, :month, and :day.");
+                unreachable;
+            }
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn dateParts(date: []const u8) ?DateParts {
+    if (parseIsoTimestamp(date) == null) return null;
+    return .{ .year = date[0..4], .month = date[5..7], .day = date[8..10] };
+}
+
+fn validSlugPath(slug: []const u8) bool {
+    if (slug.len == 0 or slug[0] == '/' or slug[slug.len - 1] == '/') return false;
+    var previous_slash = false;
+    var segment_start: usize = 0;
+    for (slug, 0..) |c, i| {
+        if (std.ascii.isWhitespace(c)) return false;
+        if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '/')) return false;
+        if (c == '/') {
+            if (previous_slash or std.mem.eql(u8, slug[segment_start..i], ".") or std.mem.eql(u8, slug[segment_start..i], "..")) return false;
+            previous_slash = true;
+            segment_start = i + 1;
+        } else {
+            previous_slash = false;
+        }
+    }
+    return !std.mem.eql(u8, slug[segment_start..], ".") and !std.mem.eql(u8, slug[segment_start..], "..");
+}
+
 fn slugify(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     var prev_dash = false;
@@ -2586,6 +2709,7 @@ const initConfig =
     \\.language = "en",
     \\.timezone = "UTC",
     \\.author = "Example Author",
+    \\.permalink = "/posts/:year/:month/:slug/",
     \\.content_dir = "content",
     \\.layouts_dir = "layouts",
     \\.out_dir = "public",
@@ -2608,6 +2732,7 @@ const initIndex =
 const initPost =
     \\---
     \\.title = "Hello zlog",
+    \\.slug = "hello-zlog",
     \\.date = "2026-06-23T00:00:00+09:00",
     \\.tags = ["zig", "ssg"],
     \\.layout = "post.shtml",
@@ -2658,6 +2783,7 @@ test "site config reads metadata fields and renders head metadata" {
     try std.testing.expectEqualStrings("en-US", site.language);
     try std.testing.expectEqualStrings("+09:00", site.timezone);
     try std.testing.expectEqualStrings("Example Author", site.author);
+    try std.testing.expectEqualStrings("/:slug/", site.permalink);
 
     const head = try renderHead(std.testing.allocator, site);
     defer std.testing.allocator.free(head);
@@ -2671,6 +2797,10 @@ test "site config rejects invalid metadata fields" {
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .language = "en_US" }, "zlog.ziggy"));
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .timezone = "Tokyo" }, "zlog.ziggy"));
     try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .author = "Bad\nAuthor" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "posts/:slug/" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/posts/:unknown/" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/posts//:slug/" }, "zlog.ziggy"));
+    try std.testing.expectError(error.InvalidSite, validateSiteConfig(.{ .permalink = "/../:slug/" }, "zlog.ziggy"));
 }
 
 test "frontmatter parser reads title tags and draft" {
@@ -2685,6 +2815,46 @@ test "frontmatter parser reads title tags and draft" {
     try std.testing.expectEqualStrings("Post", fm.title);
     try std.testing.expectEqual(@as(usize, 2), fm.tags.len);
     try std.testing.expect(!fm.draft);
+}
+
+test "post permalink policy supports date parts and custom slugs" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/content/posts");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/zlog.ziggy",
+        .data =
+        \\.title = "Example",
+        \\.url = "https://example.com",
+        \\.permalink = "/posts/:year/:month/:slug/",
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/content/posts/hello.md",
+        .data =
+        \\---
+        \\.title = "Hello",
+        \\.slug = "custom-hello",
+        \\.date = "2026-06-23T00:00:00+09:00",
+        \\---
+        \\# Hello
+        ,
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    const site = try loadSite(allocator, root);
+    var pages = try loadPages(allocator, root, site);
+    defer pages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), pages.items.len);
+    try std.testing.expectEqualStrings("custom-hello", pages.items[0].slug);
+    try std.testing.expectEqualStrings("/posts/2026/06/custom-hello/", pages.items[0].url);
+
+    var routes = try buildRouteGraph(allocator, root, site, pages.items);
+    defer routes.deinit();
+    try std.testing.expect(routes.containsUrl("/posts/2026/06/custom-hello/"));
 }
 
 test "frontmatter parser rejects schema type mismatches" {
