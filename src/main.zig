@@ -129,12 +129,18 @@ const RouteGraph = struct {
 
 const AssetKind = enum { page_asset, site_asset, build_asset };
 
+const ImageDimensions = struct {
+    width: u32,
+    height: u32,
+};
+
 const Asset = struct {
     kind: AssetKind,
     owner_path: []const u8 = "",
     source_path: []const u8 = "",
     url: []const u8,
     out_path: []const u8,
+    dimensions: ?ImageDimensions = null,
 };
 
 const AssetGraph = struct {
@@ -266,8 +272,10 @@ fn cmdCheck(allocator: std.mem.Allocator, dir: []const u8) !void {
     defer pages.deinit();
     var routes = try buildRouteGraph(allocator, dir, site, pages.items);
     defer routes.deinit();
+    var assets = try buildAssetGraph(allocator, pages.items, routes);
+    defer assets.deinit();
     try validatePages(allocator, pages.items, routes);
-    try validateRenderedHtml(allocator, dir, site, pages.items, routes);
+    try validateRenderedHtml(allocator, dir, site, pages.items, routes, assets);
     try stdout("check ok: {d} pages\n", .{pages.items.len});
 }
 
@@ -293,7 +301,7 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
-        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets);
         try writeAll(allocator, route.out_path, final_html);
     }
 
@@ -542,7 +550,7 @@ fn loadLayoutForPage(allocator: std.mem.Allocator, dir: []const u8, site: SiteCo
     return .{ .path = layout_path, .html = layout };
 }
 
-fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph) !void {
+fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph, assets: AssetGraph) !void {
     const post_list = try renderPostList(allocator, pages, site);
     const head = renderHead(site);
     const runtime = prefetchRuntime;
@@ -551,21 +559,23 @@ fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: Sit
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
-        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets);
         allocator.free(final_html);
     }
 
     try validateGeneratedListingHtml(allocator, routes, pages, site, head, runtime);
 }
 
-fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8) ![]const u8 {
+fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8, assets: AssetGraph) ![]const u8 {
     try validateHtmlDocument(allocator, layout.html, layout.path);
     const rendered = try renderLayout(allocator, layout.html, layout.path, site, page, content, post_list, head, runtime);
     defer allocator.free(rendered);
     const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
-    errdefer allocator.free(final_html);
-    try validateHtmlDocument(allocator, final_html, output_path);
-    return final_html;
+    defer allocator.free(final_html);
+    const sized_html = try applyImageDimensions(allocator, final_html, page.url, assets);
+    errdefer allocator.free(sized_html);
+    try validateHtmlDocument(allocator, sized_html, output_path);
+    return sized_html;
 }
 
 fn validateGeneratedListingHtml(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
@@ -1363,8 +1373,8 @@ fn buildAssetGraph(allocator: std.mem.Allocator, pages: []Page, routes: RouteGra
 
     for (routes.routes.items) |route| {
         switch (route.kind) {
-            .static_asset => try addRouteAsset(&graph, .site_asset, "", route),
-            .page, .post, .tag, .archive, .rss, .sitemap => try addRouteAsset(&graph, .build_asset, routeOwnerPath(pages, route), route),
+            .static_asset => try addRouteAsset(allocator, &graph, .site_asset, "", route),
+            .page, .post, .tag, .archive, .rss, .sitemap => try addRouteAsset(allocator, &graph, .build_asset, routeOwnerPath(pages, route), route),
         }
     }
 
@@ -1376,13 +1386,14 @@ fn buildAssetGraph(allocator: std.mem.Allocator, pages: []Page, routes: RouteGra
     return graph;
 }
 
-fn addRouteAsset(graph: *AssetGraph, kind: AssetKind, owner_path: []const u8, route: Route) !void {
+fn addRouteAsset(allocator: std.mem.Allocator, graph: *AssetGraph, kind: AssetKind, owner_path: []const u8, route: Route) !void {
     try graph.add(.{
         .kind = kind,
         .owner_path = try assetOwnCopy(graph, owner_path),
         .source_path = try assetOwnCopy(graph, route.source_path),
         .url = try assetOwnCopy(graph, route.url),
         .out_path = try assetOwnCopy(graph, route.out_path),
+        .dimensions = if (kind == .site_asset) try probeImageDimensionsFromFile(allocator, route.source_path) else null,
     });
 }
 
@@ -1403,6 +1414,7 @@ fn addPageReferencedAssets(allocator: std.mem.Allocator, graph: *AssetGraph, pag
                         .source_path = try assetOwnCopy(graph, route.source_path),
                         .url = try assetOwnCopy(graph, route.url),
                         .out_path = try assetOwnCopy(graph, route.out_path),
+                        .dimensions = try probeImageDimensionsFromFile(allocator, route.source_path),
                     });
                 }
             }
@@ -1419,6 +1431,102 @@ fn routeOwnerPath(pages: []Page, route: Route) []const u8 {
 
 fn assetOwnCopy(graph: *AssetGraph, value: []const u8) ![]const u8 {
     return graph.own(try graph.allocator.dupe(u8, value));
+}
+
+fn probeImageDimensionsFromFile(allocator: std.mem.Allocator, path: []const u8) !?ImageDimensions {
+    if (!isSupportedImagePath(path)) return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(data);
+    return probeImageDimensions(data);
+}
+
+fn isSupportedImagePath(path: []const u8) bool {
+    return endsWithIgnoreCase(path, ".png") or
+        endsWithIgnoreCase(path, ".jpg") or
+        endsWithIgnoreCase(path, ".jpeg") or
+        endsWithIgnoreCase(path, ".gif");
+}
+
+fn endsWithIgnoreCase(value: []const u8, suffix: []const u8) bool {
+    if (value.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(value[value.len - suffix.len ..], suffix);
+}
+
+fn probeImageDimensions(data: []const u8) ?ImageDimensions {
+    if (probePngDimensions(data)) |dimensions| return dimensions;
+    if (probeGifDimensions(data)) |dimensions| return dimensions;
+    if (probeJpegDimensions(data)) |dimensions| return dimensions;
+    return null;
+}
+
+fn probePngDimensions(data: []const u8) ?ImageDimensions {
+    const png_signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+    if (data.len < 24 or !std.mem.eql(u8, data[0..8], &png_signature)) return null;
+    if (!std.mem.eql(u8, data[12..16], "IHDR")) return null;
+    return .{
+        .width = readU32Be(data, 16),
+        .height = readU32Be(data, 20),
+    };
+}
+
+fn probeGifDimensions(data: []const u8) ?ImageDimensions {
+    if (data.len < 10) return null;
+    if (!std.mem.startsWith(u8, data, "GIF87a") and !std.mem.startsWith(u8, data, "GIF89a")) return null;
+    return .{
+        .width = readU16Le(data, 6),
+        .height = readU16Le(data, 8),
+    };
+}
+
+fn probeJpegDimensions(data: []const u8) ?ImageDimensions {
+    if (data.len < 4 or data[0] != 0xff or data[1] != 0xd8) return null;
+    var i: usize = 2;
+    while (i + 3 < data.len) {
+        while (i < data.len and data[i] != 0xff) i += 1;
+        while (i < data.len and data[i] == 0xff) i += 1;
+        if (i >= data.len) return null;
+        const marker = data[i];
+        i += 1;
+        if (marker == 0xd9 or marker == 0xda) return null;
+        if (marker == 0x01 or (marker >= 0xd0 and marker <= 0xd7)) continue;
+        if (i + 2 > data.len) return null;
+        const segment_len = readU16Be(data, i);
+        if (segment_len < 2 or i + segment_len > data.len) return null;
+        if (isJpegStartOfFrame(marker)) {
+            if (segment_len < 7) return null;
+            return .{
+                .height = readU16Be(data, i + 3),
+                .width = readU16Be(data, i + 5),
+            };
+        }
+        i += segment_len;
+    }
+    return null;
+}
+
+fn readU16Be(data: []const u8, index: usize) u16 {
+    return (@as(u16, data[index]) << 8) | data[index + 1];
+}
+
+fn readU16Le(data: []const u8, index: usize) u16 {
+    return @as(u16, data[index]) | (@as(u16, data[index + 1]) << 8);
+}
+
+fn readU32Be(data: []const u8, index: usize) u32 {
+    return (@as(u32, data[index]) << 24) |
+        (@as(u32, data[index + 1]) << 16) |
+        (@as(u32, data[index + 2]) << 8) |
+        data[index + 3];
+}
+
+fn isJpegStartOfFrame(marker: u8) bool {
+    return switch (marker) {
+        0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf => true,
+        else => false,
+    };
 }
 
 fn outputRelForUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
@@ -1845,7 +1953,55 @@ const prefetchRuntime =
 ;
 
 fn rewriteNavigationAttributes(allocator: std.mem.Allocator, html: []const u8, default_prefetch: []const u8) ![]const u8 {
-    return try replaceAll(allocator, html, "data-z-prefetch>", try std.fmt.allocPrint(allocator, "data-z-prefetch=\"{s}\">", .{default_prefetch}));
+    const replacement = try std.fmt.allocPrint(allocator, "data-z-prefetch=\"{s}\">", .{default_prefetch});
+    defer allocator.free(replacement);
+    return try replaceAll(allocator, html, "data-z-prefetch>", replacement);
+}
+
+fn applyImageDimensions(allocator: std.mem.Allocator, html: []const u8, base_url: []const u8, assets: AssetGraph) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse break;
+        const tag = html[lt .. gt + 1];
+        if (startTagName(tag)) |name| {
+            const width_attr = templateAttrValue(tag, "width");
+            const height_attr = templateAttrValue(tag, "height");
+            if (std.ascii.eqlIgnoreCase(name, "img") and (width_attr == null or height_attr == null)) {
+                if (templateAttrValue(tag, "src")) |src| {
+                    if (try imageAssetForSrc(allocator, assets, base_url, src)) |asset| {
+                        if (asset.dimensions) |dimensions| {
+                            const insert_at = imageDimensionInsertOffset(html, lt, gt);
+                            try out.appendSlice(html[i..insert_at]);
+                            if (width_attr == null) try out.print(" width=\"{d}\"", .{dimensions.width});
+                            if (height_attr == null) try out.print(" height=\"{d}\"", .{dimensions.height});
+                            try out.appendSlice(html[insert_at .. gt + 1]);
+                            i = gt + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        try out.appendSlice(html[i .. gt + 1]);
+        i = gt + 1;
+    }
+    try out.appendSlice(html[i..]);
+    return out.toOwnedSlice();
+}
+
+fn imageAssetForSrc(allocator: std.mem.Allocator, assets: AssetGraph, base_url: []const u8, src: []const u8) !?Asset {
+    const link = try resolveInternalLink(allocator, base_url, src) orelse return null;
+    defer link.deinit(allocator);
+    return assets.firstByKindAndUrl(.site_asset, link.path) orelse assets.firstByKindAndUrl(.page_asset, link.path);
+}
+
+fn imageDimensionInsertOffset(html: []const u8, lt: usize, gt: usize) usize {
+    var i = gt;
+    while (i > lt and std.ascii.isWhitespace(html[i - 1])) i -= 1;
+    if (i > lt and html[i - 1] == '/') return i - 1;
+    return gt;
 }
 
 fn applyTransitionNames(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
@@ -2209,6 +2365,60 @@ test "static assets are copied recursively without changing bytes" {
     const copied = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, copied_path, std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(copied);
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xff, 0x42, 0x7f }, copied);
+}
+
+test "image dimensions are probed from supported image headers" {
+    const png_3x2 = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R', 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02 };
+    const gif_4x5 = [_]u8{ 'G', 'I', 'F', '8', '9', 'a', 0x04, 0x00, 0x05, 0x00 };
+    const jpeg_3x2 = [_]u8{ 0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x02, 0x00, 0x03, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00 };
+
+    const png = probeImageDimensions(&png_3x2).?;
+    try std.testing.expectEqual(@as(u32, 3), png.width);
+    try std.testing.expectEqual(@as(u32, 2), png.height);
+    const gif = probeImageDimensions(&gif_4x5).?;
+    try std.testing.expectEqual(@as(u32, 4), gif.width);
+    try std.testing.expectEqual(@as(u32, 5), gif.height);
+    const jpeg = probeImageDimensions(&jpeg_3x2).?;
+    try std.testing.expectEqual(@as(u32, 3), jpeg.width);
+    try std.testing.expectEqual(@as(u32, 2), jpeg.height);
+    try std.testing.expect(isSupportedImagePath("LOGO.PNG"));
+}
+
+test "rendered image tags receive known local dimensions" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/static/img");
+    const png_3x2 = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0x00, 0x00, 0x00, 0x0d, 'I', 'H', 'D', 'R', 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x02 };
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/img/logo.png", .data = &png_3x2 });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{.{
+        .source_path = "content/index.md",
+        .slug = "index",
+        .url = "/",
+        .fm = .{ .title = "Home" },
+        .markdown = "![Logo](/img/logo.png)",
+        .html = "<p><img src=\"/img/logo.png\" alt=\"Logo\"></p>",
+        .is_post = false,
+    }};
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    var assets = try buildAssetGraph(std.testing.allocator, pages[0..], routes);
+    defer assets.deinit();
+    const route = findPageRoute(routes, "/").?;
+    const layout =
+        \\<html><body><main><img src="/img/logo.png" alt="Template" width="3"><template z-replace="content"></template></main></body></html>
+    ;
+    const html = try renderPageOutputHtml(std.testing.allocator, .{ .path = "<test layout>", .html = layout }, .{}, pages[0], pages[0].html, "", "", "", route.out_path, assets);
+    defer std.testing.allocator.free(html);
+
+    try std.testing.expect(std.mem.indexOf(u8, html, "src=\"/img/logo.png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "alt=\"Logo\" width=\"3\" height=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "alt=\"Template\" width=\"3\" height=\"2\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "width=\"3\" width=\"3\"") == null);
 }
 
 test "internal link validation resolves anchors route variants relative links and assets" {
