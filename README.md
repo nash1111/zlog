@@ -8,22 +8,23 @@ Implemented now:
 
 - `zlog init [dir]` scaffold with `zlog.ziggy`, `content/index.md`, `content/posts/hello.md`, `layouts/base.shtml`, and `layouts/post.shtml`.
 - `zlog check [dir]` for config/frontmatter parsing, required title/date checks on posts, duplicate heading IDs, and broken internal Markdown links.
-- `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
+- `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, cmark-gfm Markdown rendering, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
 - `zlog dev [dir]` as a minimal rebuild-once development command placeholder.
 
-Not implemented yet: real SuperHTML/Ziggy integration, cmark-gfm, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
+Not implemented yet: real SuperHTML/Ziggy integration, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
 
 ## Build and test
 
-This MVP was verified with Zig built from Codeberg `ziglang/zig` default branch (`master`, current development line) at commit `8f7febfa6f5900e64bee1636c2bbc13bd5a52bd6`, producing `stage3/bin/zig` reporting `0.17.0`.
+This MVP is currently verified with Zig 0.16.0.
 
 ```bash
+sudo apt-get install libcmark-gfm-dev libcmark-gfm-extensions-dev
 zig build test
 zig build
 ./zig-out/bin/zlog --help
 ```
 
-If Zig is not installed locally, install a recent Zig release first, or build the current Codeberg development branch and use its `stage3/bin/zig`.
+If Zig is not installed locally, install a recent Zig release first.
 
 ## Usage
 
