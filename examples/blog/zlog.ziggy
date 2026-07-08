@@ -1,5 +1,8 @@
 .title = "example.dev",
 .url = "https://example.dev",
+.language = "en",
+.timezone = "+09:00",
+.author = "Example Author",
 .content_dir = "content",
 .layouts_dir = "layouts",
 .out_dir = "public",
