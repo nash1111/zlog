@@ -1,8 +1,8 @@
 # zlog
 
-zlog is a Zig-native static site generator for small blogs and static sites. It
-builds local Markdown content into static HTML, listing pages, taxonomy pages,
-RSS, a sitemap, and copied static assets.
+zlog is a Zig-native static site generator for small blogs, documentation, and
+static sites. It builds local Markdown content into static HTML, listing pages,
+taxonomy pages, RSS, a sitemap, a search index, and copied static assets.
 
 ## Install
 
@@ -88,7 +88,7 @@ zlog dev [dir] [port]
   IDs, internal links and anchors, generated HTML structure, and duplicate
   `view-transition-name` values.
 - `build` writes static HTML, paginated listings, taxonomy pages, archive
-  pages, RSS, sitemap, and static assets.
+  pages, RSS, sitemap, search index, and static assets.
 - `dev` runs `build`, serves the output directory, watches project files, and
   provides live reload over a local Server-Sent Events endpoint.
 
@@ -240,9 +240,33 @@ The renderer validates layout structure and rejects legacy `{{...}}` tokens.
 - archive pages under `/archive/`
 - `rss.xml`
 - `sitemap.xml`
+- `search.json`
 
 RSS and sitemap output use `.url` for absolute URLs. Sitemap entries exclude
-drafts, RSS, sitemap, and static asset routes.
+drafts, RSS, sitemap, search index, and static asset routes.
+
+`search.json` is a local client-side search index:
+
+```json
+{
+  "version": 1,
+  "items": [
+    {
+      "title": "Hello zlog",
+      "url": "/posts/2026/06/hello-zlog/",
+      "date": "2026-06-23T00:00:00+09:00",
+      "updated": "",
+      "body": "Hello zlog This is a generated post.",
+      "tags": ["zig", "ssg"],
+      "categories": ["Engineering"],
+      "series": ["Building zlog"]
+    }
+  ]
+}
+```
+
+Only generated content pages and posts are included. Drafts and generated
+listing, feed, sitemap, search, and static asset routes are omitted.
 
 ## Navigation
 
