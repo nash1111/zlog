@@ -65,18 +65,19 @@ The current `zlog dev` command rebuilds once through the same production output
 path, so it does not publish drafts locally. A future preview mode can add an
 explicit draft flag without changing production behavior.
 
-## Template tokens
+## Template attributes
 
-The MVP uses small HTML-first token replacement instead of a full SuperHTML renderer:
+Layouts are rendered as validated HTML with explicit `z-*` template attributes:
 
-- `{{site.title}}`
-- `{{page.title}}`
-- `{{page.date}}`
-- `{{page.tags}}`
-- `{{content}}`
-- `{{post_list}}`
-- `{{zlog.head}}`
-- `{{zlog.runtime}}`
+- `z-text="binding"` replaces an element body with escaped text.
+- `z-html="binding"` replaces an element body with trusted rendered HTML.
+- `z-replace="binding"` replaces the whole element with trusted rendered HTML.
+- `z-attr:name="binding"` writes an escaped attribute when the binding is not empty.
+
+Supported bindings are `site.title`, `page.title`, `page.full_title`,
+`page.date`, `page.transition`, `page.tags`, `content`, `post_list`,
+`zlog.head`, and `zlog.runtime`. Legacy `{{...}}` tokens are rejected during
+template rendering.
 
 ## Navigation hints
 
