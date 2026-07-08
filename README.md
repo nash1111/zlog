@@ -40,7 +40,7 @@ zig build
 
 The generated site is written to `public/` by default.
 
-Set `.url` in `zlog.ziggy` to the canonical public URL for the site. RSS output uses this value for absolute channel, item, and GUID URLs.
+Set `.url` in `zlog.ziggy` to the canonical public URL for the site. RSS and sitemap output use this value for absolute URLs.
 
 `zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
