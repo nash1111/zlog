@@ -125,7 +125,7 @@ Important fields:
 
 ## Frontmatter
 
-Markdown files use Ziggy-style frontmatter.
+Markdown files use Ziggy-style frontmatter as the native authoring format.
 
 ```md
 ---
@@ -150,6 +150,33 @@ published routes, listing pages, taxonomy pages, RSS, and sitemap output.
 
 The current `zlog dev` command rebuilds and serves the same production output
 path on localhost, so it does not publish drafts locally.
+
+For migration from existing sites, zlog also imports a small YAML-style
+frontmatter subset in the same `---` block:
+
+```md
+---
+title: Hello zlog
+slug: hello-zlog
+date: 2026-06-23T00:00:00+09:00
+updated: 2026-06-24T00:00:00+09:00
+tags: [zig, ssg]
+categories:
+  - Engineering
+series:
+  - Building zlog
+layout: post.shtml
+draft: false
+prefetch: hover
+transition: post-title:hello
+---
+```
+
+The YAML import path supports the same frontmatter fields as Ziggy. Scalar
+fields are read as strings, `draft` is read as a boolean, and `tags`,
+`categories`, and `series` are read as inline or block string arrays. New
+content should prefer Ziggy syntax so schema diagnostics and examples stay
+consistent.
 
 ## Markdown
 
