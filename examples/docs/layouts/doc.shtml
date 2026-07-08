@@ -1,0 +1,18 @@
+<!doctype html>
+<html z-attr:lang="site.language">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title z-text="page.full_title"></title>
+  <template z-replace="zlog.head"></template>
+</head>
+<body>
+  <header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header>
+  <article>
+    <h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1>
+    <p><time z-text="page.date"></time> <span z-replace="page.taxonomies"></span></p>
+    <template z-replace="content"></template>
+  </article>
+  <template z-replace="zlog.runtime"></template>
+</body>
+</html>
