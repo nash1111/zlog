@@ -69,6 +69,7 @@ const Page = struct {
     url: []const u8,
     fm: Frontmatter,
     markdown: []const u8,
+    body_line: usize = 1,
     html: []const u8,
     is_post: bool,
 };
@@ -131,6 +132,14 @@ const default_dev_port: u16 = 1111;
 const watch_poll_interval_ms: i64 = 750;
 
 pub fn main(init: std.process.Init) !void {
+    run(init) catch |err| switch (err) {
+        error.InvalidSite => std.process.exit(1),
+        error.Usage => std.process.exit(2),
+        else => return err,
+    };
+}
+
+fn run(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     runtime_io = init.io;
 
@@ -494,7 +503,7 @@ fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: Sit
 
 fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8) ![]const u8 {
     try validateHtmlDocument(allocator, layout.html, layout.path);
-    const rendered = try renderLayout(allocator, layout.html, site, page, content, post_list, head, runtime);
+    const rendered = try renderLayout(allocator, layout.html, layout.path, site, page, content, post_list, head, runtime);
     defer allocator.free(rendered);
     const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
     errdefer allocator.free(final_html);
@@ -596,23 +605,27 @@ fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []cons
     const slug = slugFromPath(rel);
     const url = if (std.mem.eql(u8, rel, "index.md")) try allocator.dupe(u8, "/") else try std.fmt.allocPrint(allocator, "/{s}/", .{slug});
     const html = try markdownToHtml(allocator, split.body);
-    return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .html = html, .is_post = is_post };
+    return Page{ .source_path = path, .slug = slug, .url = url, .fm = fm, .markdown = split.body, .body_line = split.body_line, .html = html, .is_post = is_post };
 }
 
 const FrontmatterSplit = struct {
     frontmatter: []const u8,
     body: []const u8,
     frontmatter_line: usize,
+    body_line: usize,
 };
 
 fn splitFrontmatter(text: []const u8) FrontmatterSplit {
-    if (!std.mem.startsWith(u8, text, "---")) return .{ .frontmatter = "", .body = text, .frontmatter_line = 1 };
+    if (!std.mem.startsWith(u8, text, "---")) return .{ .frontmatter = "", .body = text, .frontmatter_line = 1, .body_line = 1 };
     const rest = text[3..];
     if (std.mem.indexOf(u8, rest, "\n---")) |idx| {
         const body_start = 3 + idx + 4;
-        return .{ .frontmatter = std.mem.trim(u8, rest[0..idx], " \t\r\n"), .body = std.mem.trimStart(u8, text[body_start..], "\r\n"), .frontmatter_line = 2 };
+        const body_raw = text[body_start..];
+        const body = std.mem.trimStart(u8, body_raw, "\r\n");
+        const body_index = body_start + (body_raw.len - body.len);
+        return .{ .frontmatter = std.mem.trim(u8, rest[0..idx], " \t\r\n"), .body = body, .frontmatter_line = 2, .body_line = sourceLocationAt(text, body_index).line };
     }
-    return .{ .frontmatter = "", .body = text, .frontmatter_line = 1 };
+    return .{ .frontmatter = "", .body = text, .frontmatter_line = 1, .body_line = 1 };
 }
 
 fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize, collection: ContentCollection) !Frontmatter {
@@ -707,6 +720,11 @@ const ZiggyParser = struct {
         return error.InvalidSite;
     }
 
+    fn failHint(self: ZiggyParser, comptime fmt: []const u8, args: anytype, hint: []const u8) anyerror {
+        failAtHint(self.path, self.line, self.column, fmt, args, hint) catch |err| return err;
+        return error.InvalidSite;
+    }
+
     fn skipIgnored(self: *ZiggyParser) !void {
         while (!self.isDone()) {
             switch (self.peek()) {
@@ -724,7 +742,7 @@ const ZiggyParser = struct {
     }
 
     fn expect(self: *ZiggyParser, expected: u8) !void {
-        if (self.isDone() or self.peek() != expected) return self.fail("expected '{c}'", .{expected});
+        if (self.isDone() or self.peek() != expected) return self.failHint("expected '{c}'", .{expected}, "Use Ziggy field syntax such as .title = \"...\".");
         _ = self.advance();
     }
 
@@ -742,7 +760,7 @@ const ZiggyParser = struct {
 
     fn parseIdentifier(self: *ZiggyParser) anyerror![]const u8 {
         if (self.isDone() or !(std.ascii.isAlphabetic(self.peek()) or self.peek() == '_')) {
-            return self.fail("expected field name", .{});
+            return self.failHint("expected field name", .{}, "Field names start with a dot, for example .title.");
         }
         const start = self.index;
         while (!self.isDone() and (std.ascii.isAlphanumeric(self.peek()) or self.peek() == '_')) _ = self.advance();
@@ -759,7 +777,7 @@ const ZiggyParser = struct {
                 try self.expect('{');
                 while (true) {
                     try self.skipIgnored();
-                    if (self.isDone()) return self.fail("unterminated object", .{});
+                    if (self.isDone()) return self.failHint("unterminated object", .{}, "Close the object with }.");
                     if (self.peek() == '}') {
                         _ = self.advance();
                         break;
@@ -768,7 +786,7 @@ const ZiggyParser = struct {
                 }
                 break :blk .object;
             },
-            else => self.fail("unsupported Ziggy value", .{}),
+            else => self.failHint("unsupported Ziggy value", .{}, "Use a string, bool, string array, or .{ ... } object value."),
         };
     }
 
@@ -782,14 +800,14 @@ const ZiggyParser = struct {
                 _ = self.advance();
                 return value;
             }
-            if (c == '\n') return self.fail("unterminated string", .{});
+            if (c == '\n') return self.failHint("unterminated string", .{}, "Close the string with a matching quote.");
             if (c == '\\') {
                 _ = self.advance();
-                if (self.isDone()) return self.fail("unterminated escape sequence", .{});
+                if (self.isDone()) return self.failHint("unterminated escape sequence", .{}, "Add the escaped character after the backslash.");
             }
             _ = self.advance();
         }
-        return self.fail("unterminated string", .{});
+        return self.failHint("unterminated string", .{}, "Close the string with a matching quote.");
     }
 
     fn parseStringArray(self: *ZiggyParser) anyerror![]const []const u8 {
@@ -797,12 +815,12 @@ const ZiggyParser = struct {
         var values = std.array_list.Managed([]const u8).init(self.allocator);
         while (true) {
             try self.skipIgnored();
-            if (self.isDone()) return self.fail("unterminated array", .{});
+            if (self.isDone()) return self.failHint("unterminated array", .{}, "Close the array with ].");
             if (self.peek() == ']') {
                 _ = self.advance();
                 return values.toOwnedSlice();
             }
-            if (self.peek() != '"') return self.fail("expected string in array", .{});
+            if (self.peek() != '"') return self.failHint("expected string in array", .{}, "Use quoted string entries, for example [\"zig\", \"ssg\"].");
             try values.append(try self.parseString());
         }
     }
@@ -818,7 +836,7 @@ const ZiggyParser = struct {
             self.column += 5;
             return false;
         }
-        return self.fail("expected bool", .{});
+        return self.failHint("expected bool", .{}, "Use true or false without quotes.");
     }
 };
 
@@ -827,7 +845,7 @@ fn ziggyString(doc: ZiggyDoc, path: []const u8, name: []const u8, default: []con
     return switch (field.value) {
         .string => |value| value,
         else => {
-            try failAt(path, field.line, field.column, ".{s} must be a string", .{name});
+            try failAtHint(path, field.line, field.column, ".{s} must be a string", .{name}, "Use a quoted string value.");
             unreachable;
         },
     };
@@ -835,16 +853,16 @@ fn ziggyString(doc: ZiggyDoc, path: []const u8, name: []const u8, default: []con
 
 fn ziggyRequiredString(doc: ZiggyDoc, path: []const u8, line: usize, name: []const u8) ![]const u8 {
     const field = doc.find(name) orelse {
-        try failAt(path, line, 1, "missing required field .{s}", .{name});
+        try failAtHint(path, line, 1, "missing required field .{s}", .{name}, "Add the field to the frontmatter block.");
         unreachable;
     };
     return switch (field.value) {
         .string => |value| if (value.len > 0) value else {
-            try failAt(path, field.line, field.column, ".{s} must not be empty", .{name});
+            try failAtHint(path, field.line, field.column, ".{s} must not be empty", .{name}, "Provide a non-empty quoted string value.");
             unreachable;
         },
         else => {
-            try failAt(path, field.line, field.column, ".{s} must be a string", .{name});
+            try failAtHint(path, field.line, field.column, ".{s} must be a string", .{name}, "Use a quoted string value.");
             unreachable;
         },
     };
@@ -855,7 +873,7 @@ fn ziggyBool(doc: ZiggyDoc, path: []const u8, name: []const u8, default: bool) !
     return switch (field.value) {
         .bool => |value| value,
         else => {
-            try failAt(path, field.line, field.column, ".{s} must be a bool", .{name});
+            try failAtHint(path, field.line, field.column, ".{s} must be a bool", .{name}, "Use true or false without quotes.");
             unreachable;
         },
     };
@@ -866,7 +884,7 @@ fn ziggyStringArray(doc: ZiggyDoc, path: []const u8, name: []const u8) ![]const 
     return switch (field.value) {
         .string_array => |value| value,
         else => {
-            try failAt(path, field.line, field.column, ".{s} must be an array of strings", .{name});
+            try failAtHint(path, field.line, field.column, ".{s} must be an array of strings", .{name}, "Use an array such as [\"zig\", \"ssg\"].");
             unreachable;
         },
     };
@@ -988,20 +1006,30 @@ fn addPrefetchPlaceholders(allocator: std.mem.Allocator, html: []const u8) ![]co
 
 fn validatePages(allocator: std.mem.Allocator, pages: []Page, routes: RouteGraph) !void {
     for (pages) |page| {
-        if (page.fm.title.len == 0) return fail("missing .title in {s}", .{page.source_path});
-        if (page.is_post and page.fm.date.len == 0) return fail("missing .date in post {s}", .{page.source_path});
+        if (page.fm.title.len == 0) return failAtHint(page.source_path, 1, 1, "missing .title", .{}, "Add .title = \"...\" to the frontmatter block.");
+        if (page.is_post and page.fm.date.len == 0) return failAtHint(page.source_path, 1, 1, "missing .date in post", .{}, "Posts must include .date = \"...\" in frontmatter.");
         try validateDuplicateHeadings(allocator, page);
         try validateInternalLinks(allocator, page, pages, routes);
     }
 }
 
 fn fail(comptime fmt: []const u8, args: anytype) !void {
+    return failHint(fmt, args, "");
+}
+
+fn failHint(comptime fmt: []const u8, args: anytype, hint: []const u8) !void {
     try stderr("error: " ++ fmt ++ "\n", args);
+    if (hint.len > 0) try stderr("  hint: {s}\n", .{hint});
     return error.InvalidSite;
 }
 
 fn failAt(path: []const u8, line: usize, column: usize, comptime fmt: []const u8, args: anytype) !void {
+    return failAtHint(path, line, column, fmt, args, "");
+}
+
+fn failAtHint(path: []const u8, line: usize, column: usize, comptime fmt: []const u8, args: anytype, hint: []const u8) !void {
     try stderr("{s}:{d}:{d}: error: " ++ fmt ++ "\n", .{ path, line, column } ++ args);
+    if (hint.len > 0) try stderr("  hint: {s}\n", .{hint});
     return error.InvalidSite;
 }
 
@@ -1013,8 +1041,10 @@ fn validateDuplicateHeadings(allocator: std.mem.Allocator, page: Page) !void {
         ids.deinit();
     }
 
+    var line_start: usize = 0;
     var lines = std.mem.splitScalar(u8, page.markdown, '\n');
     while (lines.next()) |line| {
+        defer line_start += line.len + 1;
         if (std.mem.startsWith(u8, line, "#")) {
             var level: usize = 0;
             while (level < line.len and line[level] == '#') level += 1;
@@ -1022,7 +1052,8 @@ fn validateDuplicateHeadings(allocator: std.mem.Allocator, page: Page) !void {
             const id = try slugify(allocator, title);
             if (ids.contains(id)) {
                 defer allocator.free(id);
-                return fail("duplicate heading id '{s}' in {s}", .{ id, page.source_path });
+                const loc = markdownLocationAt(page, line_start);
+                return failAtHint(page.source_path, loc.line, loc.column, "duplicate heading id '{s}'", .{id}, "Rename one heading so generated heading ids are unique.");
             }
             ids.put(id, {}) catch |err| {
                 allocator.free(id);
@@ -1042,23 +1073,30 @@ const ResolvedLink = struct {
 };
 
 fn validateInternalLinks(allocator: std.mem.Allocator, page: Page, pages: []Page, routes: RouteGraph) !void {
-    var rest = page.markdown;
-    while (std.mem.indexOf(u8, rest, "](")) |idx| {
-        rest = rest[idx + 2 ..];
+    var offset: usize = 0;
+    while (std.mem.indexOfPos(u8, page.markdown, offset, "](")) |idx| {
+        const destination_start = idx + 2;
+        const rest = page.markdown[destination_start..];
         const end = std.mem.indexOfScalar(u8, rest, ')') orelse break;
         const destination = markdownLinkDestination(rest[0..end]);
         if (try resolveInternalLink(allocator, page.url, destination)) |link| {
             defer link.deinit(allocator);
-            const route = findRouteForLink(routes, link.path) orelse return fail("broken internal link '{s}' in {s}", .{ destination, page.source_path });
+            const loc = markdownLocationAt(page, destination_start);
+            const route = findRouteForLink(routes, link.path) orelse return failAtHint(page.source_path, loc.line, loc.column, "broken internal link '{s}'", .{destination}, "Create the target page/static file or update the link destination.");
             if (link.fragment.len > 0 and (route.kind == .page or route.kind == .post)) {
-                const target = findPageByUrl(pages, route.url) orelse return fail("broken internal link '{s}' in {s}", .{ destination, page.source_path });
-                if (!htmlHasId(target.html, link.fragment)) return fail("broken internal anchor '{s}' in {s}", .{ destination, page.source_path });
+                const target = findPageByUrl(pages, route.url) orelse return failAtHint(page.source_path, loc.line, loc.column, "broken internal link '{s}'", .{destination}, "Create the target page or update the link destination.");
+                if (!htmlHasId(target.html, link.fragment)) return failAtHint(page.source_path, loc.line, loc.column, "broken internal anchor '{s}'", .{destination}, "Add a heading that generates this id, or update the fragment.");
             } else if (link.fragment.len > 0) {
-                return fail("broken internal anchor '{s}' in {s}", .{ destination, page.source_path });
+                return failAtHint(page.source_path, loc.line, loc.column, "broken internal anchor '{s}'", .{destination}, "Fragments can only be validated against generated page and post HTML.");
             }
         }
-        rest = rest[end + 1 ..];
+        offset = destination_start + end + 1;
     }
+}
+
+fn markdownLocationAt(page: Page, index: usize) SourceLocation {
+    const loc = sourceLocationAt(page.markdown, index);
+    return .{ .line = page.body_line + loc.line - 1, .column = loc.column };
 }
 
 fn markdownLinkDestination(raw: []const u8) []const u8 {
@@ -1303,12 +1341,12 @@ const SourceLocation = struct {
     column: usize,
 };
 
-fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8) ![]const u8 {
+fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, layout_path: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8) ![]const u8 {
     const page_tags = try renderTagsInline(allocator, page.fm.tags);
     defer allocator.free(page_tags);
     const page_full_title = try std.fmt.allocPrint(allocator, "{s} - {s}", .{ page.fm.title, site.title });
     defer allocator.free(page_full_title);
-    const rendered = try renderTemplate(allocator, layout, .{
+    const rendered = try renderTemplate(allocator, layout, layout_path, .{
         .site = site,
         .page = page,
         .content = content,
@@ -1322,20 +1360,23 @@ fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, site: SiteConf
     return applyTransitionNames(allocator, rendered);
 }
 
-fn renderTemplate(allocator: std.mem.Allocator, layout: []const u8, ctx: TemplateContext) ![]const u8 {
-    if (std.mem.indexOf(u8, layout, "{{") != null) {
-        try fail("legacy template token found; use z-text, z-html, z-replace, or z-attr:*", .{});
+fn renderTemplate(allocator: std.mem.Allocator, layout: []const u8, layout_path: []const u8, ctx: TemplateContext) ![]const u8 {
+    if (std.mem.indexOf(u8, layout, "{{")) |idx| {
+        const loc = sourceLocationAt(layout, idx);
+        try failAtHint(layout_path, loc.line, loc.column, "legacy template token found", .{}, "Replace {{...}} with z-text, z-html, z-replace, or z-attr:* attributes.");
         unreachable;
     }
-    try validateTemplateStructure(allocator, layout);
+    try validateTemplateStructure(allocator, layout, layout_path);
 
     var out = std.array_list.Managed(u8).init(allocator);
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, layout, i, '<')) |lt| {
         const gt = std.mem.indexOfScalarPos(u8, layout, lt, '>') orelse {
-            try fail("invalid template HTML structure", .{});
+            const loc = sourceLocationAt(layout, lt);
+            try failAtHint(layout_path, loc.line, loc.column, "unterminated template tag", .{}, "Close the tag with >.");
             unreachable;
         };
+        const loc = sourceLocationAt(layout, lt);
         const tag = layout[lt .. gt + 1];
         const name = startTagName(tag) orelse {
             try out.appendSlice(layout[i .. gt + 1]);
@@ -1352,39 +1393,39 @@ fn renderTemplate(allocator: std.mem.Allocator, layout: []const u8, ctx: Templat
         try out.appendSlice(layout[i..lt]);
         if (action == .replace) {
             const expr = templateAttrValue(tag, "z-replace") orelse {
-                try fail("missing z-replace value on <{s}>", .{name});
+                try failAtHint(layout_path, loc.line, loc.column, "missing z-replace value on <{s}>", .{name}, "Set z-replace to a supported binding such as content.");
                 unreachable;
             };
             const close = findClosingTag(layout, gt + 1, name) orelse {
-                try fail("missing closing tag for <{s}>", .{name});
+                try failAtHint(layout_path, loc.line, loc.column, "missing closing tag for <{s}>", .{name}, "Add the matching closing tag after the replace target.");
                 unreachable;
             };
-            try out.appendSlice(try templateValue(ctx, expr));
+            try out.appendSlice(try templateValue(ctx, expr, layout_path, loc));
             i = close.end;
             continue;
         }
 
         const close = if (action == .text or action == .html)
             findClosingTag(layout, gt + 1, name) orelse {
-                try fail("missing closing tag for <{s}>", .{name});
+                try failAtHint(layout_path, loc.line, loc.column, "missing closing tag for <{s}>", .{name}, "Add the matching closing tag around the template slot.");
                 unreachable;
             }
         else
             null;
 
-        const rendered_tag = try renderTemplateStartTag(allocator, tag, ctx);
+        const rendered_tag = try renderTemplateStartTag(allocator, tag, ctx, layout_path, loc);
         defer allocator.free(rendered_tag);
         try out.appendSlice(rendered_tag);
 
         if (action == .text or action == .html) {
             const expr = if (action == .text) templateAttrValue(tag, "z-text") orelse {
-                try fail("missing z-text value on <{s}>", .{name});
+                try failAtHint(layout_path, loc.line, loc.column, "missing z-text value on <{s}>", .{name}, "Set z-text to a supported binding such as page.title.");
                 unreachable;
             } else templateAttrValue(tag, "z-html") orelse {
-                try fail("missing z-html value on <{s}>", .{name});
+                try failAtHint(layout_path, loc.line, loc.column, "missing z-html value on <{s}>", .{name}, "Set z-html to a supported binding such as content.");
                 unreachable;
             };
-            const value = try templateValue(ctx, expr);
+            const value = try templateValue(ctx, expr, layout_path, loc);
             if (action == .text) {
                 try appendEscaped(&out, value);
             } else {
@@ -1408,7 +1449,7 @@ fn templateAction(tag: []const u8) TemplateAction {
     return .none;
 }
 
-fn templateValue(ctx: TemplateContext, expr: []const u8) ![]const u8 {
+fn templateValue(ctx: TemplateContext, expr: []const u8, layout_path: []const u8, loc: SourceLocation) ![]const u8 {
     const name = std.mem.trim(u8, expr, " \t\r\n");
     if (std.mem.eql(u8, name, "site.title")) return ctx.site.title;
     if (std.mem.eql(u8, name, "page.title")) return ctx.page.fm.title;
@@ -1420,11 +1461,11 @@ fn templateValue(ctx: TemplateContext, expr: []const u8) ![]const u8 {
     if (std.mem.eql(u8, name, "post_list")) return ctx.post_list;
     if (std.mem.eql(u8, name, "zlog.head")) return ctx.head;
     if (std.mem.eql(u8, name, "zlog.runtime")) return ctx.runtime;
-    try fail("unknown template binding '{s}'", .{name});
+    try failAtHint(layout_path, loc.line, loc.column, "unknown template binding '{s}'", .{name}, "Use a supported binding such as page.title, content, or zlog.head.");
     unreachable;
 }
 
-fn renderTemplateStartTag(allocator: std.mem.Allocator, tag: []const u8, ctx: TemplateContext) ![]const u8 {
+fn renderTemplateStartTag(allocator: std.mem.Allocator, tag: []const u8, ctx: TemplateContext, layout_path: []const u8, loc: SourceLocation) ![]const u8 {
     const name = startTagName(tag) orelse return allocator.dupe(u8, tag);
     var out = std.array_list.Managed(u8).init(allocator);
     try out.append('<');
@@ -1454,7 +1495,7 @@ fn renderTemplateStartTag(allocator: std.mem.Allocator, tag: []const u8, ctx: Te
         if (std.mem.eql(u8, attr_name, "z-text") or std.mem.eql(u8, attr_name, "z-html") or std.mem.eql(u8, attr_name, "z-replace")) continue;
         if (std.mem.startsWith(u8, attr_name, "z-attr:")) {
             const value = templateAttrValue(tag, attr_name) orelse "";
-            const rendered = try templateValue(ctx, value);
+            const rendered = try templateValue(ctx, value, layout_path, loc);
             if (rendered.len == 0) continue;
             try out.append(' ');
             try out.appendSlice(attr_name["z-attr:".len..]);
@@ -1505,8 +1546,8 @@ fn templateAttrValue(tag: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-fn validateTemplateStructure(allocator: std.mem.Allocator, html: []const u8) !void {
-    try validateHtmlDocument(allocator, html, "<template>");
+fn validateTemplateStructure(allocator: std.mem.Allocator, html: []const u8, path: []const u8) !void {
+    try validateHtmlDocument(allocator, html, path);
 }
 
 fn validateHtmlDocument(allocator: std.mem.Allocator, html: []const u8, path: []const u8) !void {
@@ -1517,26 +1558,26 @@ fn validateHtmlDocument(allocator: std.mem.Allocator, html: []const u8, path: []
         if (std.mem.startsWith(u8, html[lt..], "<!--")) {
             const end = std.mem.indexOf(u8, html[lt + 4 ..], "-->") orelse {
                 const loc = sourceLocationAt(html, lt);
-                return failAt(path, loc.line, loc.column, "unterminated HTML comment", .{});
+                return failAtHint(path, loc.line, loc.column, "unterminated HTML comment", .{}, "Close the comment with -->.");
             };
             i = lt + 4 + end + 3;
             continue;
         }
         const loc = sourceLocationAt(html, lt);
-        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return failAt(path, loc.line, loc.column, "unterminated HTML tag", .{});
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return failAtHint(path, loc.line, loc.column, "unterminated HTML tag", .{}, "Close the tag with >.");
         const tag = html[lt .. gt + 1];
         if (tag.len >= 2 and (tag[1] == '!' or tag[1] == '?')) {
             i = gt + 1;
             continue;
         }
         if (closingTagName(tag)) |name| {
-            if (stack.items.len == 0) return failAt(path, loc.line, loc.column, "unexpected closing tag </{s}>", .{name});
+            if (stack.items.len == 0) return failAtHint(path, loc.line, loc.column, "unexpected closing tag </{s}>", .{name}, "Remove the closing tag or add a matching opening tag.");
             const open = stack.items[stack.items.len - 1];
-            if (!std.ascii.eqlIgnoreCase(open.name, name)) return failAt(path, loc.line, loc.column, "closing tag </{s}> does not match <{s}> opened at {d}:{d}", .{ name, open.name, open.line, open.column });
+            if (!std.ascii.eqlIgnoreCase(open.name, name)) return failAtHint(path, loc.line, loc.column, "closing tag </{s}> does not match <{s}> opened at {d}:{d}", .{ name, open.name, open.line, open.column }, "Fix the tag nesting so each closing tag matches the most recent open tag.");
             _ = stack.pop();
         } else if (startTagName(tag)) |name| {
             if (isRawTextHtmlTag(name)) {
-                const close = findClosingTag(html, gt + 1, name) orelse return failAt(path, loc.line, loc.column, "missing closing tag for <{s}>", .{name});
+                const close = findClosingTag(html, gt + 1, name) orelse return failAtHint(path, loc.line, loc.column, "missing closing tag for <{s}>", .{name}, "Add the matching closing tag.");
                 i = close.end;
                 continue;
             }
@@ -1546,7 +1587,7 @@ fn validateHtmlDocument(allocator: std.mem.Allocator, html: []const u8, path: []
     }
     if (stack.items.len > 0) {
         const open = stack.items[stack.items.len - 1];
-        return failAt(path, open.line, open.column, "unclosed HTML tag <{s}>", .{open.name});
+        return failAtHint(path, open.line, open.column, "unclosed HTML tag <{s}>", .{open.name}, "Add the matching closing tag.");
     }
 }
 
@@ -1727,7 +1768,7 @@ fn renderTagPageHtml(allocator: std.mem.Allocator, tag: []const u8, tag_slug: []
     defer allocator.free(body_html);
 
     const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-    return renderLayout(allocator, initBaseLayout, site, fake, body_html, "", head, runtime);
+    return renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, body_html, "", head, runtime);
 }
 
 fn renderArchivePage(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
@@ -1747,7 +1788,7 @@ fn renderArchivePageHtml(allocator: std.mem.Allocator, pages: []Page, site: Site
     defer allocator.free(body_html);
 
     const fake = Page{ .source_path = "", .slug = "archive", .url = "/archive/", .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-    return renderLayout(allocator, initBaseLayout, site, fake, body_html, "", head, runtime);
+    return renderLayout(allocator, initBaseLayout, "<builtin base layout>", site, fake, body_html, "", head, runtime);
 }
 
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
@@ -2119,7 +2160,7 @@ test "template renderer applies attributes and raw slots" {
         .html = "",
         .is_post = true,
     };
-    const html = try renderLayout(std.testing.allocator, initPostLayout, .{ .title = "Example" }, page, "<p>Body</p>", "", "", "");
+    const html = try renderLayout(std.testing.allocator, initPostLayout, "<test layout>", .{ .title = "Example" }, page, "<p>Body</p>", "", "", "");
     defer std.testing.allocator.free(html);
 
     try std.testing.expect(std.mem.indexOf(u8, html, "<title>A &amp; B - Example</title>") != null);
@@ -2141,8 +2182,8 @@ test "template renderer rejects invalid structure and legacy tokens" {
         .page_tags = "",
         .page_full_title = "Home - zlog site",
     };
-    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main><p></main>", ctx));
-    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main>{{content}}</main>", ctx));
+    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main><p></main>", "<test layout>", ctx));
+    try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main>{{content}}</main>", "<test layout>", ctx));
 }
 
 test "html validator reports malformed generated markup" {
