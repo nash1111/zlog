@@ -69,6 +69,8 @@ Ziggy-like frontmatter is supported for the MVP:
 .date = "2026-06-23T00:00:00+09:00",
 .updated = "2026-06-24T00:00:00+09:00",
 .tags = ["zig", "ssg"],
+.categories = ["Engineering"],
+.series = ["Building zlog"],
 .layout = "post.shtml",
 .draft = false,
 .prefetch = "hover",
@@ -98,10 +100,11 @@ Layouts are rendered as validated HTML with explicit `z-*` template attributes:
 - `z-attr:name="binding"` writes an escaped attribute when the binding is not empty.
 
 Supported bindings are `site.title`, `page.title`, `page.full_title`,
-`page.date`, `page.transition`, `page.tags`, `content`, `post_list`,
-`pagination`, `pagination.current`, `pagination.total`,
+`page.date`, `page.transition`, `page.tags`, `page.taxonomies`, `content`,
+`post_list`, `pagination`, `pagination.current`, `pagination.total`,
 `pagination.previous_url`, `pagination.next_url`, `zlog.head`, and
-`zlog.runtime`. `z-replace="pagination"` inserts generated pagination
+`zlog.runtime`. `z-replace="page.taxonomies"` inserts links for tags,
+categories, and series. `z-replace="pagination"` inserts generated pagination
 navigation when a listing spans multiple pages. Legacy `{{...}}` tokens are
 rejected during template rendering.
 
