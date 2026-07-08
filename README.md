@@ -49,10 +49,12 @@ Site-wide metadata lives in `zlog.ziggy`:
 .timezone = "UTC",
 .author = "Example Author",
 .permalink = "/posts/:year/:month/:slug/",
+.page_size = 10,
 ```
 
 RSS and sitemap output use `.url` for absolute URLs. RSS, generated metadata, and templates can also consume `.language`, `.timezone`, and `.author`.
 Post URLs use `.permalink`; supported placeholders are `:slug`, `:year`, `:month`, and `:day`.
+Listing pages use `.page_size`; additional index, tag, and archive pages are generated as needed.
 
 `zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
 
@@ -97,8 +99,11 @@ Layouts are rendered as validated HTML with explicit `z-*` template attributes:
 
 Supported bindings are `site.title`, `page.title`, `page.full_title`,
 `page.date`, `page.transition`, `page.tags`, `content`, `post_list`,
-`zlog.head`, and `zlog.runtime`. Legacy `{{...}}` tokens are rejected during
-template rendering.
+`pagination`, `pagination.current`, `pagination.total`,
+`pagination.previous_url`, `pagination.next_url`, `zlog.head`, and
+`zlog.runtime`. `z-replace="pagination"` inserts generated pagination
+navigation when a listing spans multiple pages. Legacy `{{...}}` tokens are
+rejected during template rendering.
 
 ## Navigation hints
 
