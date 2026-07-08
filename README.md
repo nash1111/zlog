@@ -28,6 +28,7 @@ Release archive naming is documented in `docs/releases.md`.
 The proposed plugin hook shape is documented in `docs/plugins.md`.
 The optional client router strategy is documented in `docs/client-router.md`.
 The MDX and islands evaluation criteria are documented in `docs/mdx-islands.md`.
+The SSR evaluation criteria are documented in `docs/ssr.md`.
 
 ## Continuous Integration
 
