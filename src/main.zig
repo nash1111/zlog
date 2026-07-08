@@ -20,6 +20,8 @@ const Frontmatter = struct {
     transition: []const u8 = "",
 };
 
+const ContentCollection = enum { page, post };
+
 const Heading = struct {
     level: usize,
     id: []const u8,
@@ -231,9 +233,9 @@ fn walkMarkdown(allocator: std.mem.Allocator, root: []const u8, dir: []const u8,
 fn loadPage(allocator: std.mem.Allocator, content_root: []const u8, path: []const u8) !Page {
     const text = try std.Io.Dir.cwd().readFileAlloc(runtime_io, path, allocator, .limited(8 * 1024 * 1024));
     const split = splitFrontmatter(text);
-    const fm = try parseFrontmatter(allocator, split.frontmatter, path, split.frontmatter_line);
     const rel = std.mem.trimStart(u8, path[content_root.len..], std.Io.Dir.path.sep_str);
     const is_post = std.mem.startsWith(u8, rel, "posts/");
+    const fm = try parseFrontmatter(allocator, split.frontmatter, path, split.frontmatter_line, if (is_post) .post else .page);
     const slug = slugFromPath(rel);
     const url = if (std.mem.eql(u8, rel, "index.md")) try allocator.dupe(u8, "/") else try std.fmt.allocPrint(allocator, "/{s}/", .{slug});
     const html = try markdownToHtml(allocator, split.body);
@@ -256,12 +258,12 @@ fn splitFrontmatter(text: []const u8) FrontmatterSplit {
     return .{ .frontmatter = "", .body = text, .frontmatter_line = 1 };
 }
 
-fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize) !Frontmatter {
+fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize, collection: ContentCollection) !Frontmatter {
     const doc = try parseZiggyFields(allocator, text, path, line_start);
     defer allocator.free(doc.fields);
     return Frontmatter{
-        .title = try ziggyString(doc, path, "title", ""),
-        .date = try ziggyString(doc, path, "date", ""),
+        .title = try ziggyRequiredString(doc, path, line_start, "title"),
+        .date = if (collection == .post) try ziggyRequiredString(doc, path, line_start, "date") else try ziggyString(doc, path, "date", ""),
         .layout = try ziggyString(doc, path, "layout", "base.shtml"),
         .tags = try ziggyStringArray(doc, path, "tags"),
         .draft = try ziggyBool(doc, path, "draft", false),
@@ -467,6 +469,23 @@ fn ziggyString(doc: ZiggyDoc, path: []const u8, name: []const u8, default: []con
     const field = doc.find(name) orelse return default;
     return switch (field.value) {
         .string => |value| value,
+        else => {
+            try failAt(path, field.line, field.column, ".{s} must be a string", .{name});
+            unreachable;
+        },
+    };
+}
+
+fn ziggyRequiredString(doc: ZiggyDoc, path: []const u8, line: usize, name: []const u8) ![]const u8 {
+    const field = doc.find(name) orelse {
+        try failAt(path, line, 1, "missing required field .{s}", .{name});
+        unreachable;
+    };
+    return switch (field.value) {
+        .string => |value| if (value.len > 0) value else {
+            try failAt(path, field.line, field.column, ".{s} must not be empty", .{name});
+            unreachable;
+        },
         else => {
             try failAt(path, field.line, field.column, ".{s} must be a string", .{name});
             unreachable;
@@ -939,10 +958,11 @@ const initPostLayout =
 test "frontmatter parser reads title tags and draft" {
     const text =
         \\.title = "Post",
+        \\.date = "2026-06-27",
         \\.tags = ["zig", "ssg"],
         \\.draft = false,
     ;
-    const fm = try parseFrontmatter(std.testing.allocator, text, "post.md", 1);
+    const fm = try parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post);
     defer std.testing.allocator.free(fm.tags);
     try std.testing.expectEqualStrings("Post", fm.title);
     try std.testing.expectEqual(@as(usize, 2), fm.tags.len);
@@ -952,16 +972,36 @@ test "frontmatter parser reads title tags and draft" {
 test "frontmatter parser rejects schema type mismatches" {
     const text =
         \\.title = "Post",
+        \\.date = "2026-06-27",
         \\.tags = "zig",
     ;
-    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1));
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post));
 }
 
 test "frontmatter parser reports malformed Ziggy syntax" {
     const text =
         \\.title = "Post
     ;
-    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1));
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post));
+}
+
+test "post schema requires title and date" {
+    const text =
+        \\.title = "Post",
+    ;
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "posts/post.md", 1, .post));
+}
+
+test "page schema applies defaults without post date" {
+    const text =
+        \\.title = "Page",
+    ;
+    const fm = try parseFrontmatter(std.testing.allocator, text, "page.md", 1, .page);
+    defer std.testing.allocator.free(fm.tags);
+    try std.testing.expectEqualStrings("Page", fm.title);
+    try std.testing.expectEqualStrings("", fm.date);
+    try std.testing.expectEqualStrings("base.shtml", fm.layout);
+    try std.testing.expect(!fm.draft);
 }
 
 test "markdown renderer emits headings paragraphs and links" {
