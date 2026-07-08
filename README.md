@@ -1,66 +1,111 @@
 # zlog
 
-`zlog` is a tiny Zig-native blog/static-site generator prototype based on the plan in `zig-blog-ssg-framework-plan.md`.
+zlog is a Zig-native static site generator for small blogs and static sites. It
+builds local Markdown content into static HTML, listing pages, taxonomy pages,
+RSS, a sitemap, and copied static assets.
 
-## MVP scope
+## Install
 
-Implemented now:
-
-- `zlog init [dir]` scaffold with `zlog.ziggy`, `content/index.md`, `content/posts/hello.md`, `layouts/base.shtml`, and `layouts/post.shtml`.
-- `zlog check [dir]` for config/frontmatter parsing, required title/date checks on posts, duplicate heading IDs, and broken internal Markdown links.
-- `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, cmark-gfm Markdown rendering, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
-- `zlog dev [dir] [port]` to serve the generated `public/` output on localhost and rebuild when project files change.
-
-Not implemented yet: external SuperHTML integration, plugin ecosystem, SSR, MDX, islands, or client router.
-
-## Build and test
-
-This MVP is currently verified with Zig 0.16.0.
+Build from source with Zig 0.16.0 and the cmark-gfm development libraries:
 
 ```bash
 sudo apt-get install libcmark-gfm-dev libcmark-gfm-extensions-dev
-zig build test
 zig build
+```
+
+The development binary is written to `zig-out/bin/zlog`.
+
+Useful verification commands:
+
+```bash
+zig build test
 zig build release-local
 ./zig-out/bin/zlog --help
 ```
 
-If Zig is not installed locally, install a recent Zig release first.
-Release artifact naming and packaging are documented in `docs/releases.md`.
+Release archive naming is documented in `docs/releases.md`.
 
-## Usage
+## Quickstart
 
 ```bash
 zig build
-./zig-out/bin/zlog init my-blog
-./zig-out/bin/zlog check my-blog
-./zig-out/bin/zlog build my-blog
-./zig-out/bin/zlog dev my-blog 1111
+./zig-out/bin/zlog init my-site
+./zig-out/bin/zlog check my-site
+./zig-out/bin/zlog build my-site
+./zig-out/bin/zlog dev my-site 1111
 ```
 
-The generated site is written to `public/` by default.
+`init` creates this starter structure:
 
-Site-wide metadata lives in `zlog.ziggy`:
+```text
+my-site/
+  zlog.ziggy
+  content/
+    index.md
+    posts/hello.md
+  layouts/
+    base.shtml
+    post.shtml
+```
 
-```ziggy
+`build` writes the generated site to `public/` by default. `dev` builds once,
+serves that output on localhost, watches `zlog.ziggy`, `content/`, `layouts/`,
+and `static/`, then reloads browser pages after successful rebuilds. If a
+rebuild fails, the previous output stays served and the browser shows a failure
+notice until the next successful save.
+
+## Commands
+
+```bash
+zlog init [dir]
+zlog check [dir]
+zlog build [dir]
+zlog dev [dir] [port]
+```
+
+- `init` scaffolds a starter site.
+- `check` validates config, frontmatter, required post dates, duplicate heading
+  IDs, internal links and anchors, generated HTML structure, and duplicate
+  `view-transition-name` values.
+- `build` writes static HTML, paginated listings, taxonomy pages, archive
+  pages, RSS, sitemap, and static assets.
+- `dev` runs `build`, serves the output directory, watches project files, and
+  provides live reload over a local Server-Sent Events endpoint.
+
+## Configuration
+
+Configuration lives in `zlog.ziggy`.
+
+```zig
 .title = "example.dev",
 .url = "https://example.dev",
 .language = "en",
 .timezone = "UTC",
 .author = "Example Author",
+.content_dir = "content",
+.layouts_dir = "layouts",
+.out_dir = "public",
 .permalink = "/posts/:year/:month/:slug/",
 .page_size = 10,
+.prefetch_default = "hover",
+.speculation_rules = true,
 ```
 
-RSS and sitemap output use `.url` for absolute URLs. RSS, generated metadata, and templates can also consume `.language`, `.timezone`, and `.author`.
-Post URLs use `.permalink`; supported placeholders are `:slug`, `:year`, `:month`, and `:day`.
-Listing pages use `.page_size`; additional index, tag, and archive pages are generated as needed.
+Important fields:
 
-`zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Browser pages reload after successful rebuilds; failed rebuilds are surfaced in the page while existing output stays served.
+- `.url` is used for absolute RSS and sitemap URLs.
+- `.language`, `.timezone`, and `.author` feed generated metadata, RSS, and
+  templates.
+- `.content_dir`, `.layouts_dir`, and `.out_dir` change the project folders.
+- `.permalink` supports `:slug`, `:year`, `:month`, and `:day`.
+- `.page_size` controls index, taxonomy, and archive pagination.
+- `.prefetch_default` fills Markdown links that do not set
+  `data-z-prefetch` themselves.
+- `.speculation_rules` controls generated Speculation Rules in page heads.
 
 ## Frontmatter
 
-Ziggy-like frontmatter is supported for the MVP:
+Markdown files use Ziggy-style frontmatter.
 
 ```md
 ---
@@ -80,40 +125,107 @@ Ziggy-like frontmatter is supported for the MVP:
 # Hello
 ```
 
-## Draft content
-
-Set `.draft = true` to keep a page or post out of production output. Draft
-content is skipped when writing HTML pages and is also omitted from index, tag,
-archive, RSS, and sitemap output.
+Pages require `.title`. Posts also require `.date`. Draft content is skipped by
+published routes, listing pages, taxonomy pages, RSS, and sitemap output.
 
 The current `zlog dev` command rebuilds and serves the same production output
-path on localhost, so it does not publish drafts locally. A future preview mode
-can add an explicit draft flag without changing production behavior.
+path on localhost, so it does not publish drafts locally.
 
-## Template attributes
+## Markdown
 
-Layouts are rendered as validated HTML with explicit `z-*` template attributes:
+Markdown is rendered with cmark-gfm and the core GitHub-flavored Markdown
+features used by zlog:
+
+- headings with generated IDs
+- links, images, autolinks, lists, and blockquotes
+- fenced code blocks with language classes
+- pipe tables
+- emphasis, strong emphasis, and strikethrough
+- task lists and footnotes
+
+zlog adds stable heading IDs and `data-z-prefetch` placeholders after Markdown
+rendering.
+
+## Layouts
+
+Layouts are HTML files under the configured `layouts_dir`. They use explicit
+`z-*` attributes instead of `{{...}}` tokens.
 
 - `z-text="binding"` replaces an element body with escaped text.
 - `z-html="binding"` replaces an element body with trusted rendered HTML.
 - `z-replace="binding"` replaces the whole element with trusted rendered HTML.
-- `z-attr:name="binding"` writes an escaped attribute when the binding is not empty.
+- `z-attr:name="binding"` writes an escaped attribute when the binding is not
+  empty.
+- `z-replace="page.taxonomies"` inserts links for tags, categories, and series.
+- `z-replace="pagination"` inserts generated pagination navigation when a
+  listing spans multiple pages.
 
-Supported bindings are `site.title`, `page.title`, `page.full_title`,
-`page.date`, `page.transition`, `page.tags`, `page.taxonomies`, `content`,
-`post_list`, `pagination`, `pagination.current`, `pagination.total`,
+Supported bindings include `site.title`, `site.url`, `site.language`,
+`site.timezone`, `site.author`, `page.title`, `page.full_title`, `page.date`,
+`page.transition`, `page.tags`, `page.taxonomies`, `content`, `post_list`,
+`pagination`, `pagination.current`, `pagination.total`,
 `pagination.previous_url`, `pagination.next_url`, `zlog.head`, and
-`zlog.runtime`. `z-replace="page.taxonomies"` inserts links for tags,
-categories, and series. `z-replace="pagination"` inserts generated pagination
-navigation when a listing spans multiple pages. Legacy `{{...}}` tokens are
-rejected during template rendering.
+`zlog.runtime`.
+
+The renderer validates layout structure and rejects legacy `{{...}}` tokens.
 `zlog check` also validates rendered HTML and rejects duplicate
 `view-transition-name` values within the same page.
 
-## Navigation hints
+## Generated Pages
+
+`build` emits:
+
+- content pages and posts
+- the home listing and additional `/page/N/` pages when needed
+- tag pages under `/tags/:slug/`
+- category pages under `/categories/:slug/`
+- series pages under `/series/:slug/`
+- archive pages under `/archive/`
+- `rss.xml`
+- `sitemap.xml`
+
+RSS and sitemap output use `.url` for absolute URLs. Sitemap entries exclude
+drafts, RSS, sitemap, and static asset routes.
+
+## Navigation
 
 Generated pages include:
 
-- `@view-transition { navigation: auto; }` CSS.
-- RouteGraph-derived `script type="speculationrules"` document rules for known internal `tap` and `hover` links.
-- a tiny JS fallback for `hover`, `tap`, `viewport`, and `load` prefetch values.
+- `@view-transition { navigation: auto; }` CSS
+- RouteGraph-derived `script type="speculationrules"` document rules for known
+  internal `tap` and `hover` links
+- a small JavaScript fallback for `hover`, `tap`, `viewport`, and `load`
+  prefetch values
+
+The dev server injects its live reload script only into served HTML responses.
+It does not write live reload code into files generated by `zlog build`.
+
+## Static Assets
+
+Files under `static/` are copied recursively into the output directory. Static
+assets can be linked from Markdown or layouts with root-relative URLs such as
+`/app.css` or `/img/logo.png`.
+
+For local PNG and JPEG assets referenced by generated pages, zlog adds missing
+`width` and `height` attributes when dimensions can be read.
+
+## Deploy
+
+Before publishing, set `.url` to the production origin so RSS and sitemap URLs
+are correct.
+
+```bash
+./zig-out/bin/zlog check .
+./zig-out/bin/zlog build .
+```
+
+Deploy the configured output directory, usually `public/`, to any static host.
+
+## Examples
+
+The repository includes an example blog:
+
+```bash
+./zig-out/bin/zlog check examples/blog
+./zig-out/bin/zlog build examples/blog
+```
