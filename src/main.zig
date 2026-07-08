@@ -329,6 +329,8 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
+        defer allocator.free(layout.path);
+        defer allocator.free(layout.html);
         const pagination = if (std.mem.eql(u8, page.url, "/")) try makePaginationContext(allocator, "/", 1, paginationPageCount(countPublishedPosts(pages.items), site.page_size)) else OwnedPaginationContext{};
         defer pagination.deinit(allocator);
         const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets, pagination.context);
@@ -702,14 +704,105 @@ const LayoutSource = struct {
     html: []const u8,
 };
 
+const max_layout_include_depth = 16;
+
 fn loadLayoutForPage(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, page: Page) !LayoutSource {
     const layout_name = if (page.fm.layout.len == 0) "base.shtml" else page.fm.layout;
     const layout_path = try join(allocator, &.{ dir, site.layouts_dir, layout_name });
-    const layout = std.Io.Dir.cwd().readFileAlloc(runtime_io, layout_path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => if (page.is_post) initPostLayout else initBaseLayout,
+    errdefer allocator.free(layout_path);
+    const raw_layout = std.Io.Dir.cwd().readFileAlloc(runtime_io, layout_path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            const fallback = if (page.is_post) initPostLayout else initBaseLayout;
+            const html = try allocator.dupe(u8, fallback);
+            return .{ .path = layout_path, .html = html };
+        },
         else => return err,
     };
+    defer allocator.free(raw_layout);
+    const layouts_root = try join(allocator, &.{ dir, site.layouts_dir });
+    defer allocator.free(layouts_root);
+    const layout = try expandLayoutIncludes(allocator, raw_layout, layout_path, layouts_root, 0);
     return .{ .path = layout_path, .html = layout };
+}
+
+fn expandLayoutIncludes(allocator: std.mem.Allocator, html: []const u8, layout_path: []const u8, layouts_root: []const u8, depth: usize) anyerror![]const u8 {
+    if (depth > max_layout_include_depth) {
+        try failAtHint(layout_path, 1, 1, "layout partial include depth exceeded", .{}, "Check for recursive z-include partials.");
+        unreachable;
+    }
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse {
+            const loc = sourceLocationAt(html, lt);
+            try failAtHint(layout_path, loc.line, loc.column, "unterminated template tag", .{}, "Close the tag with >.");
+            unreachable;
+        };
+        const tag = html[lt .. gt + 1];
+        const include_path = templateAttrValue(tag, "z-include") orelse {
+            try out.appendSlice(html[i .. gt + 1]);
+            i = gt + 1;
+            continue;
+        };
+        const name = startTagName(tag) orelse {
+            try out.appendSlice(html[i .. gt + 1]);
+            i = gt + 1;
+            continue;
+        };
+        const loc = sourceLocationAt(html, lt);
+        if (templateAttrValue(tag, "z-replace") != null or templateAttrValue(tag, "z-text") != null or templateAttrValue(tag, "z-html") != null or std.mem.indexOf(u8, tag, "z-attr:") != null) {
+            try failAtHint(layout_path, loc.line, loc.column, "z-include cannot be combined with other template actions", .{}, "Use z-include by itself on a template element.");
+            unreachable;
+        }
+        const include_end = if (isSelfClosingTag(tag))
+            gt + 1
+        else if (findClosingTag(html, gt + 1, name)) |close|
+            close.end
+        else {
+            try failAtHint(layout_path, loc.line, loc.column, "missing closing tag for <{s}>", .{name}, "Add the matching closing tag after the include target.");
+            unreachable;
+        };
+
+        try out.appendSlice(html[i..lt]);
+        const partial = try loadLayoutPartial(allocator, layouts_root, include_path, layout_path, loc, depth + 1);
+        defer allocator.free(partial);
+        try out.appendSlice(partial);
+        i = include_end;
+    }
+    try out.appendSlice(html[i..]);
+    return out.toOwnedSlice();
+}
+
+fn loadLayoutPartial(allocator: std.mem.Allocator, layouts_root: []const u8, include_path_raw: []const u8, parent_path: []const u8, loc: SourceLocation, depth: usize) anyerror![]const u8 {
+    const include_path = std.mem.trim(u8, include_path_raw, " \t\r\n");
+    if (!validLayoutPartialPath(include_path)) {
+        try failAtHint(parent_path, loc.line, loc.column, "invalid layout partial path '{s}'", .{include_path}, "Use a relative path under layouts_dir without '.' or '..' segments.");
+        unreachable;
+    }
+    const path = try join(allocator, &.{ layouts_root, include_path });
+    defer allocator.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(runtime_io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => {
+            try failAtHint(parent_path, loc.line, loc.column, "missing layout partial '{s}'", .{include_path}, "Create the partial under layouts_dir or update z-include.");
+            unreachable;
+        },
+        else => return err,
+    };
+    defer allocator.free(raw);
+    return expandLayoutIncludes(allocator, raw, path, layouts_root, depth);
+}
+
+fn validLayoutPartialPath(path: []const u8) bool {
+    if (path.len == 0 or std.mem.startsWith(u8, path, "/") or std.mem.indexOfScalar(u8, path, '\\') != null) return false;
+    var saw_segment = false;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return false;
+        saw_segment = true;
+    }
+    return saw_segment;
 }
 
 fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph, assets: AssetGraph) !void {
@@ -722,6 +815,8 @@ fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: Sit
         if (page.fm.draft) continue;
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
         const layout = try loadLayoutForPage(allocator, dir, site, page);
+        defer allocator.free(layout.path);
+        defer allocator.free(layout.html);
         const pagination = if (std.mem.eql(u8, page.url, "/")) try makePaginationContext(allocator, "/", 1, paginationPageCount(countPublishedPosts(pages), site.page_size)) else OwnedPaginationContext{};
         defer pagination.deinit(allocator);
         const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path, assets, pagination.context);
@@ -4254,6 +4349,82 @@ test "template renderer applies attributes and raw slots" {
     try std.testing.expect(std.mem.indexOf(u8, html, "<p>Body</p>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "z-text") == null);
     try std.testing.expect(std.mem.indexOf(u8, html, "z-replace") == null);
+}
+
+test "layout partials are included before bindings render" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/layouts/partials");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/base.shtml",
+        .data =
+        \\<!doctype html>
+        \\<html><body><template z-include="partials/chrome.shtml"></template></body></html>
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/partials/chrome.shtml",
+        .data =
+        \\<template z-include="partials/header.shtml"></template>
+        \\<main><template z-replace="content"></template></main>
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/partials/header.shtml",
+        .data = "<header><a href=\"/\" z-text=\"site.title\"></a></header>",
+    });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const page = Page{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false };
+    const layout = try loadLayoutForPage(std.testing.allocator, root, .{}, page);
+    defer std.testing.allocator.free(layout.path);
+    defer std.testing.allocator.free(layout.html);
+    const html = try renderLayout(std.testing.allocator, layout.html, layout.path, .{ .title = "Example" }, page, "<p>Body</p>", "", "", "", .{});
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<header><a href=\"/\">Example</a></header>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "z-include") == null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "z-text") == null);
+}
+
+test "layout partials reject recursive includes" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/layouts/partials");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/base.shtml",
+        .data =
+        \\<!doctype html>
+        \\<html><body><template z-include="partials/loop.shtml"></template></body></html>
+        ,
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/partials/loop.shtml",
+        .data = "<template z-include=\"partials/loop.shtml\"></template>",
+    });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const page = Page{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false };
+    try std.testing.expectError(error.InvalidSite, loadLayoutForPage(std.testing.allocator, root, .{}, page));
+}
+
+test "layout partials reject paths outside layouts directory" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/layouts");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "site/layouts/base.shtml",
+        .data =
+        \\<!doctype html>
+        \\<html><body><template z-include="../secret.shtml"></template></body></html>
+        ,
+    });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const page = Page{ .source_path = "content/index.md", .slug = "index", .url = "/", .fm = .{ .title = "Home" }, .markdown = "", .html = "", .is_post = false };
+    try std.testing.expectError(error.InvalidSite, loadLayoutForPage(std.testing.allocator, root, .{}, page));
 }
 
 test "transition name validation rejects duplicates within one page" {

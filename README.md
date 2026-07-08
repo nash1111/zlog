@@ -201,11 +201,17 @@ Layouts are HTML files under the configured `layouts_dir`. They use explicit
 - `z-text="binding"` replaces an element body with escaped text.
 - `z-html="binding"` replaces an element body with trusted rendered HTML.
 - `z-replace="binding"` replaces the whole element with trusted rendered HTML.
+- `z-include="partials/header.shtml"` includes a shared layout partial before
+  bindings are rendered.
 - `z-attr:name="binding"` writes an escaped attribute when the binding is not
   empty.
 - `z-replace="page.taxonomies"` inserts links for tags, categories, and series.
 - `z-replace="pagination"` inserts generated pagination navigation when a
   listing spans multiple pages.
+
+Partial paths are relative to `layouts_dir` and must stay inside that
+directory. Partials can use the same `z-*` attributes as full layouts, and
+nested includes are expanded before HTML validation.
 
 Supported bindings include `site.title`, `site.url`, `site.language`,
 `site.timezone`, `site.author`, `page.title`, `page.full_title`, `page.date`,
