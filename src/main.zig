@@ -127,6 +127,7 @@ const RouteGraph = struct {
 };
 
 const CliError = error{Usage};
+const default_dev_port: u16 = 1111;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
@@ -150,8 +151,12 @@ pub fn main(init: std.process.Init) !void {
     } else if (std.mem.eql(u8, cmd, "build")) {
         try cmdBuild(allocator, dir);
     } else if (std.mem.eql(u8, cmd, "dev")) {
-        try cmdBuild(allocator, dir);
-        try stdout("dev server MVP: rebuilt once. file watch/live reload are next.\n", .{});
+        const port = if (args.len >= 4) std.fmt.parseInt(u16, args[3], 10) catch {
+            try stderr("invalid port: {s}\n\n", .{args[3]});
+            try printHelp();
+            return CliError.Usage;
+        } else default_dev_port;
+        try cmdDev(allocator, dir, port);
     } else {
         try stderr("unknown command: {s}\n\n", .{cmd});
         try printHelp();
@@ -167,7 +172,7 @@ fn printHelp() !void {
         \\  zlog init [dir]
         \\  zlog check [dir]
         \\  zlog build [dir]
-        \\  zlog dev [dir]
+        \\  zlog dev [dir] [port]
         \\
     , .{});
 }
@@ -232,6 +237,136 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     const sitemap_route = routes.firstByKind(.sitemap) orelse return fail("missing sitemap route", .{});
     try writeAll(allocator, sitemap_route.out_path, try renderSitemap(allocator, routes));
     try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
+}
+
+fn cmdDev(allocator: std.mem.Allocator, dir: []const u8, port: u16) !void {
+    try cmdBuild(allocator, dir);
+    const site = try loadSite(allocator, dir);
+    const out_dir = try join(allocator, &.{ dir, site.out_dir });
+    try serveDirectory(allocator, out_dir, port);
+}
+
+fn serveDirectory(allocator: std.mem.Allocator, root_dir: []const u8, port: u16) !void {
+    const net = std.Io.net;
+    var address = try net.IpAddress.parse("127.0.0.1", port);
+    var server = try address.listen(runtime_io, .{ .reuse_address = true });
+    defer server.deinit(runtime_io);
+
+    const actual_port = server.socket.address.getPort();
+    try stdout("serving {s} at http://127.0.0.1:{d}/\n", .{ root_dir, actual_port });
+    try stdout("press Ctrl+C to stop\n", .{});
+
+    while (true) {
+        const stream = server.accept(runtime_io) catch |err| switch (err) {
+            error.Canceled => return,
+            else => return err,
+        };
+        try handleDevConnection(allocator, root_dir, stream);
+    }
+}
+
+fn handleDevConnection(allocator: std.mem.Allocator, root_dir: []const u8, stream: std.Io.net.Stream) !void {
+    var connection = stream;
+    defer connection.close(runtime_io);
+
+    var send_buffer: [16 * 1024]u8 = undefined;
+    var recv_buffer: [16 * 1024]u8 = undefined;
+    var connection_reader = connection.reader(runtime_io, &recv_buffer);
+    var connection_writer = connection.writer(runtime_io, &send_buffer);
+    var server: std.http.Server = .init(&connection_reader.interface, &connection_writer.interface);
+
+    while (true) {
+        var request = server.receiveHead() catch |err| switch (err) {
+            error.HttpConnectionClosing => return,
+            else => return err,
+        };
+        try serveDevRequest(allocator, root_dir, &request);
+    }
+}
+
+fn serveDevRequest(allocator: std.mem.Allocator, root_dir: []const u8, request: *std.http.Server.Request) !void {
+    if (request.head.method != .GET and request.head.method != .HEAD) {
+        return request.respond("method not allowed\n", .{
+            .status = .method_not_allowed,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/plain; charset=utf-8" },
+                .{ .name = "Allow", .value = "GET, HEAD" },
+            },
+        });
+    }
+
+    const target_path = requestTargetPath(request.head.target);
+    if (!std.mem.startsWith(u8, target_path, "/")) {
+        return request.respond("bad request\n", .{
+            .status = .bad_request,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain; charset=utf-8" }},
+        });
+    }
+
+    const file_path = try servedFilePath(allocator, root_dir, target_path);
+    defer allocator.free(file_path);
+    const data = std.Io.Dir.cwd().readFileAlloc(runtime_io, file_path, allocator, .limited(32 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return request.respond("not found\n", .{
+            .status = .not_found,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain; charset=utf-8" }},
+        }),
+        else => {
+            try request.respond("internal server error\n", .{
+                .status = .internal_server_error,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "text/plain; charset=utf-8" }},
+            });
+            return err;
+        },
+    };
+    defer allocator.free(data);
+
+    try request.respond(data, .{
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = contentTypeForPath(file_path) },
+            .{ .name = "Cache-Control", .value = "no-store" },
+        },
+    });
+}
+
+fn requestTargetPath(target: []const u8) []const u8 {
+    var end = target.len;
+    if (std.mem.indexOfScalar(u8, target, '?')) |idx| end = @min(end, idx);
+    if (std.mem.indexOfScalar(u8, target, '#')) |idx| end = @min(end, idx);
+    return target[0..end];
+}
+
+fn servedFilePath(allocator: std.mem.Allocator, root_dir: []const u8, target_path: []const u8) ![]const u8 {
+    const normalized = try normalizeUrlPath(allocator, target_path);
+    defer allocator.free(normalized);
+
+    var rel_alloc: ?[]const u8 = null;
+    defer if (rel_alloc) |rel| allocator.free(rel);
+
+    const rel = if (std.mem.eql(u8, normalized, "/"))
+        "index.html"
+    else if (std.mem.endsWith(u8, normalized, "/")) rel: {
+        rel_alloc = try std.fmt.allocPrint(allocator, "{s}index.html", .{std.mem.trimStart(u8, normalized, "/")});
+        break :rel rel_alloc.?;
+    } else if (!urlPathHasExtension(normalized)) rel: {
+        rel_alloc = try std.fmt.allocPrint(allocator, "{s}/index.html", .{std.mem.trimStart(u8, normalized, "/")});
+        break :rel rel_alloc.?;
+    } else std.mem.trimStart(u8, normalized, "/");
+
+    return join(allocator, &.{ root_dir, rel });
+}
+
+fn contentTypeForPath(path: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) return "text/html; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".css")) return "text/css; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".js")) return "application/javascript; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".json")) return "application/json; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".xml")) return "application/xml; charset=utf-8";
+    if (std.mem.endsWith(u8, path, ".svg")) return "image/svg+xml";
+    if (std.mem.endsWith(u8, path, ".png")) return "image/png";
+    if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
+    if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
+    if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
+    return "application/octet-stream";
 }
 
 const LayoutSource = struct {
@@ -1946,6 +2081,25 @@ test "html validation covers generated listing pages during check" {
     var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
     defer routes.deinit();
     try std.testing.expectError(error.InvalidSite, validateGeneratedListingHtml(std.testing.allocator, routes, pages[0..], .{}, renderHead(.{}), prefetchRuntime));
+}
+
+test "dev server resolves route paths into public files" {
+    const index = try servedFilePath(std.testing.allocator, "public", "/");
+    defer std.testing.allocator.free(index);
+    try std.testing.expectEqualStrings("public/index.html", index);
+
+    const directory = try servedFilePath(std.testing.allocator, "public", "/posts/hello/");
+    defer std.testing.allocator.free(directory);
+    try std.testing.expectEqualStrings("public/posts/hello/index.html", directory);
+
+    const extensionless = try servedFilePath(std.testing.allocator, "public", "/posts/hello");
+    defer std.testing.allocator.free(extensionless);
+    try std.testing.expectEqualStrings("public/posts/hello/index.html", extensionless);
+
+    const asset = try servedFilePath(std.testing.allocator, "public", "/app.css");
+    defer std.testing.allocator.free(asset);
+    try std.testing.expectEqualStrings("public/app.css", asset);
+    try std.testing.expectEqualStrings("text/css; charset=utf-8", contentTypeForPath(asset));
 }
 
 test "markdown renderer emits headings paragraphs and links" {

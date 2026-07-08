@@ -9,9 +9,9 @@ Implemented now:
 - `zlog init [dir]` scaffold with `zlog.ziggy`, `content/index.md`, `content/posts/hello.md`, `layouts/base.shtml`, and `layouts/post.shtml`.
 - `zlog check [dir]` for config/frontmatter parsing, required title/date checks on posts, duplicate heading IDs, and broken internal Markdown links.
 - `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, cmark-gfm Markdown rendering, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
-- `zlog dev [dir]` as a minimal rebuild-once development command placeholder.
+- `zlog dev [dir] [port]` to rebuild once and serve the generated `public/` output on localhost.
 
-Not implemented yet: real SuperHTML/Ziggy integration, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
+Not implemented yet: external SuperHTML integration, incremental file watching, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
 
 ## Build and test
 
@@ -33,6 +33,7 @@ zig build
 ./zig-out/bin/zlog init my-blog
 ./zig-out/bin/zlog check my-blog
 ./zig-out/bin/zlog build my-blog
+./zig-out/bin/zlog dev my-blog 1111
 ```
 
 The generated site is written to `public/` by default.
@@ -61,9 +62,9 @@ Set `.draft = true` to keep a page or post out of production output. Draft
 content is skipped when writing HTML pages and is also omitted from index, tag,
 archive, RSS, and sitemap output.
 
-The current `zlog dev` command rebuilds once through the same production output
-path, so it does not publish drafts locally. A future preview mode can add an
-explicit draft flag without changing production behavior.
+The current `zlog dev` command rebuilds and serves the same production output
+path on localhost, so it does not publish drafts locally. A future preview mode
+can add an explicit draft flag without changing production behavior.
 
 ## Template attributes
 
