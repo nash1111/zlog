@@ -7,7 +7,7 @@
   <template z-replace="zlog.head"></template>
 </head>
 <body>
-  <header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header>
+  <template z-include="partials/site-header.shtml"></template>
   <main>
     <template z-replace="content"></template>
     <template z-replace="post_list"></template>

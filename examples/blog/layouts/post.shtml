@@ -7,7 +7,7 @@
   <template z-replace="zlog.head"></template>
 </head>
 <body>
-  <header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header>
+  <template z-include="partials/site-header.shtml"></template>
   <article>
     <h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1>
     <p><time z-text="page.date"></time> <span z-replace="page.taxonomies"></span></p>
