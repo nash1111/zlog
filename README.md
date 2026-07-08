@@ -185,10 +185,13 @@ features used by zlog:
 
 - headings with generated IDs
 - links, images, autolinks, lists, and blockquotes
-- fenced code blocks with language classes, `zlog-code` wrappers, and safe highlighting metadata
+- fenced code blocks with language classes, `zlog-code` wrappers, and safe
+  highlighting metadata
 - pipe tables
 - emphasis, strong emphasis, and strikethrough
 - task lists and footnotes
+- note, tip, and warning callouts written as blockquotes that start with
+  `[!NOTE]`, `[!TIP]`, or `[!WARNING]`
 
 zlog adds stable heading IDs and `data-z-prefetch` placeholders after Markdown
 rendering. Code blocks keep the cmark-gfm `language-*` class. Zig,
@@ -196,6 +199,10 @@ JavaScript/TypeScript, and shell blocks also receive lightweight built-in token
 spans; unsupported languages keep escaped plain code with
 `data-z-highlight="plain"` so project CSS or a later external highlighter can
 style them safely.
+
+Supported callouts render as accessible `<aside>` elements with
+`zlog-callout` classes. Unsupported `[!TYPE]` markers remain normal blockquotes
+so content still renders safely.
 
 ## Layouts
 

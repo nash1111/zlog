@@ -15,4 +15,4 @@ Prototype boundaries:
 - Sidebar support is implemented as reusable layout partials.
 - Next and previous navigation is currently authored as normal Markdown links inside content pages.
 - Table of contents rendering uses generated heading metadata from the core template binding.
-- Callouts currently use Markdown blockquotes as a safe fallback until a dedicated callout syntax exists.
+- Callouts use the core `[!NOTE]`, `[!TIP]`, and `[!WARNING]` blockquote syntax.
