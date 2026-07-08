@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  zig:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcmark-gfm-dev libcmark-gfm-extensions-dev
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check build.zig src/main.zig test/cli_integration.zig
+
+      - name: Run tests
+        run: zig build test
+
+      - name: Build binary
+        run: zig build
+
+      - name: Build examples
+        run: |
+          ./zig-out/bin/zlog check examples/blog
+          ./zig-out/bin/zlog build examples/blog
+          ./zig-out/bin/zlog check examples/docs
+          ./zig-out/bin/zlog build examples/docs
+          ./zig-out/bin/zlog check examples/portfolio
+          ./zig-out/bin/zlog build examples/portfolio
