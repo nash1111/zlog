@@ -306,6 +306,8 @@ Deploy the configured output directory, usually `public/`, to any static host.
 
 The repository includes blog, docs, and portfolio examples:
 
+- `examples/docs` is an isolated docs-layer prototype with sidebar partials, a search index hook, and docs-specific styling.
+
 ```bash
 ./zig-out/bin/zlog check examples/blog
 ./zig-out/bin/zlog build examples/blog

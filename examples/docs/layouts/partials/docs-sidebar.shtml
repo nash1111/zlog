@@ -1,0 +1,7 @@
+<aside class="docs-sidebar">
+  <nav aria-label="Documentation sidebar">
+    <strong>Using zlog</strong>
+    <a href="/docs/getting-started/" data-z-prefetch="hover">Getting started</a>
+    <a href="/docs/configuration/" data-z-prefetch="hover">Configuration</a>
+  </nav>
+</aside>
