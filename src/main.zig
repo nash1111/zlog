@@ -1678,7 +1678,9 @@ fn markdownToHtmlWithHeadings(allocator: std.mem.Allocator, markdown: []const u8
     defer allocator.free(with_heading_ids);
     const with_code_highlighting = try enhanceCodeBlocks(allocator, with_heading_ids);
     defer allocator.free(with_code_highlighting);
-    const html = try addPrefetchPlaceholders(allocator, with_code_highlighting);
+    const with_callouts = try enhanceCallouts(allocator, with_code_highlighting);
+    defer allocator.free(with_callouts);
+    const html = try addPrefetchPlaceholders(allocator, with_callouts);
     errdefer allocator.free(html);
     const owned_headings = try headings.toOwnedSlice();
     return .{ .html = html, .headings = owned_headings };
@@ -1882,6 +1884,80 @@ fn appendCodeToken(out: *std.array_list.Managed(u8), class: []const u8, value: [
     try out.appendSlice("\">");
     try out.appendSlice(value);
     try out.appendSlice("</span>");
+}
+
+const CalloutKind = struct {
+    class: []const u8,
+    title: []const u8,
+    role: []const u8,
+};
+
+fn enhanceCallouts(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var offset: usize = 0;
+    const open = "<blockquote>";
+    const close = "</blockquote>";
+    while (std.mem.indexOfPos(u8, html, offset, open)) |start| {
+        const body_start = start + open.len;
+        const end = std.mem.indexOfPos(u8, html, body_start, close) orelse break;
+        const inner = html[body_start..end];
+        try out.appendSlice(html[offset..start]);
+        if (try appendCalloutIfSupported(&out, inner)) {
+            offset = end + close.len;
+        } else {
+            try out.appendSlice(html[start .. end + close.len]);
+            offset = end + close.len;
+        }
+    }
+    try out.appendSlice(html[offset..]);
+    return out.toOwnedSlice();
+}
+
+fn appendCalloutIfSupported(out: *std.array_list.Managed(u8), inner: []const u8) !bool {
+    const marker_prefix = "<p>[!";
+    const marker_start = firstNonSpace(inner);
+    if (!std.mem.startsWith(u8, inner[marker_start..], marker_prefix)) return false;
+    const type_start = marker_start + marker_prefix.len;
+    const type_end_rel = std.mem.indexOfScalar(u8, inner[type_start..], ']') orelse return false;
+    const type_end = type_start + type_end_rel;
+    const kind = calloutKind(inner[type_start..type_end]) orelse return false;
+
+    try out.appendSlice("<aside class=\"zlog-callout zlog-callout-");
+    try out.appendSlice(kind.class);
+    try out.appendSlice("\" role=\"");
+    try out.appendSlice(kind.role);
+    try out.appendSlice("\" aria-label=\"");
+    try appendEscaped(out, kind.title);
+    try out.appendSlice("\"><p class=\"zlog-callout-title\">");
+    try appendEscaped(out, kind.title);
+    try out.appendSlice("</p>");
+
+    const after_marker = type_end + 1;
+    if (std.mem.startsWith(u8, inner[after_marker..], "</p>")) {
+        try out.appendSlice(std.mem.trimStart(u8, inner[after_marker + "</p>".len ..], " \t\r\n"));
+    } else {
+        const content = std.mem.trimStart(u8, inner[after_marker..], " \t\r\n");
+        if (content.len > 0) {
+            try out.appendSlice("<p>");
+            try out.appendSlice(content);
+        }
+    }
+    try out.appendSlice("</aside>");
+    return true;
+}
+
+fn firstNonSpace(text: []const u8) usize {
+    var i: usize = 0;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    return i;
+}
+
+fn calloutKind(raw: []const u8) ?CalloutKind {
+    if (std.ascii.eqlIgnoreCase(raw, "NOTE")) return .{ .class = "note", .title = "Note", .role = "note" };
+    if (std.ascii.eqlIgnoreCase(raw, "TIP")) return .{ .class = "tip", .title = "Tip", .role = "note" };
+    if (std.ascii.eqlIgnoreCase(raw, "WARNING")) return .{ .class = "warning", .title = "Warning", .role = "alert" };
+    return null;
 }
 
 fn collectCmarkHeadings(allocator: std.mem.Allocator, root: *cmark.node, headings: *std.array_list.Managed(Heading)) !void {
@@ -3114,6 +3190,10 @@ fn renderHead(allocator: std.mem.Allocator, site: SiteConfig, routes: RouteGraph
         \\.zlog-token-string { color: #86efac; }
         \\.zlog-token-number { color: #fbbf24; }
         \\.zlog-token-comment { color: #9ca3af; }
+        \\.zlog-callout { margin: 1rem 0; padding: 0.75rem 1rem; border-left: 4px solid #2563eb; background: #eff6ff; }
+        \\.zlog-callout-title { margin: 0 0 0.25rem; font-weight: 700; }
+        \\.zlog-callout-tip { border-left-color: #059669; background: #ecfdf5; }
+        \\.zlog-callout-warning { border-left-color: #d97706; background: #fffbeb; }
         \\</style>
         \\
     );
@@ -5099,6 +5179,41 @@ test "markdown renderer falls back safely for unsupported code languages" {
     try std.testing.expect(std.mem.indexOf(u8, html, "data-z-language=\"mermaid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "data-z-highlight=\"plain\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "zlog-token") == null);
+}
+
+test "markdown renderer turns supported blockquote markers into callouts" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\> [!NOTE]
+        \\> Run `zlog check` before publishing.
+        \\
+        \\> [!WARNING]
+        \\> Keep generated files out of reviews.
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<aside class=\"zlog-callout zlog-callout-note\" role=\"note\" aria-label=\"Note\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<p class=\"zlog-callout-title\">Note</p>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<code>zlog check</code>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<aside class=\"zlog-callout zlog-callout-warning\" role=\"alert\" aria-label=\"Warning\">") != null);
+}
+
+test "markdown renderer supports inline callout marker content" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\> [!TIP] Keep local checks close to the content change.
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<aside class=\"zlog-callout zlog-callout-tip\" role=\"note\" aria-label=\"Tip\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<p>Keep local checks close to the content change.</p>") != null);
+}
+
+test "markdown renderer leaves unsupported callout markers as blockquotes" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\> [!DANGER]
+        \\> Unsupported marker.
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<blockquote>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "[!DANGER]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "zlog-callout") == null);
 }
 
 test "markdown renderer enables gfm strikethrough task lists and footnotes" {

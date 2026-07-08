@@ -17,6 +17,7 @@ zlog init my-docs
 zlog build my-docs
 ```
 
+> [!NOTE]
 > Run `zlog check` before publishing.
 
 ## Next step

@@ -89,6 +89,10 @@ blockquote {
   background: #eff6ff;
 }
 
+.zlog-callout {
+  margin: 1rem 0;
+}
+
 .zlog-toc {
   margin: 1rem 0;
   padding: 0.75rem 1rem;
