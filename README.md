@@ -90,7 +90,9 @@ zlog dev [dir] [port]
 - `build` writes static HTML, paginated listings, taxonomy pages, archive
   pages, RSS, sitemap, search index, and static assets.
 - `dev` runs `build`, serves the output directory, watches project files, and
-  provides live reload over a local Server-Sent Events endpoint.
+  provides live reload over a local Server-Sent Events endpoint. Static-only
+  changes are copied incrementally; config, content, layout, or uncertain
+  changes fall back to a full rebuild.
 
 ## Configuration
 
