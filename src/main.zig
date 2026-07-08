@@ -1660,7 +1660,9 @@ fn markdownToHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]const u
 
     const with_heading_ids = try addHeadingIdsToHtml(allocator, rendered, headings.items);
     defer allocator.free(with_heading_ids);
-    return addPrefetchPlaceholders(allocator, with_heading_ids);
+    const with_code_highlighting = try enhanceCodeBlocks(allocator, with_heading_ids);
+    defer allocator.free(with_code_highlighting);
+    return addPrefetchPlaceholders(allocator, with_code_highlighting);
 }
 
 fn attachCmarkExtensions(parser: *cmark.parser) !void {
@@ -1669,6 +1671,198 @@ fn attachCmarkExtensions(parser: *cmark.parser) !void {
         const extension = cmark.cmark_find_syntax_extension(name) orelse return error.MarkdownExtensionUnavailable;
         if (cmark.cmark_parser_attach_syntax_extension(parser, extension) == 0) return error.MarkdownExtensionUnavailable;
     }
+}
+
+const CodeHighlightKind = enum { zig, javascript, shell };
+
+fn enhanceCodeBlocks(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var offset: usize = 0;
+    const close_marker = "</code></pre>";
+
+    while (std.mem.indexOfPos(u8, html, offset, "<pre><code")) |pre_start| {
+        const code_start = pre_start + "<pre>".len;
+        const code_tag_end = std.mem.indexOfScalarPos(u8, html, code_start, '>') orelse break;
+        const code_end = std.mem.indexOfPos(u8, html, code_tag_end + 1, close_marker) orelse break;
+        const code_tag = html[code_start .. code_tag_end + 1];
+        const code_html = html[code_tag_end + 1 .. code_end];
+        const language = codeBlockLanguage(code_tag) orelse "";
+        const block = try renderCodeBlock(allocator, code_tag, language, code_html);
+        defer allocator.free(block);
+        try out.appendSlice(html[offset..pre_start]);
+        try out.appendSlice(block);
+        offset = code_end + close_marker.len;
+    }
+
+    try out.appendSlice(html[offset..]);
+    return out.toOwnedSlice();
+}
+
+fn codeBlockLanguage(code_tag: []const u8) ?[]const u8 {
+    const class_attr = templateAttrValue(code_tag, "class") orelse return null;
+    var parts = std.mem.splitScalar(u8, class_attr, ' ');
+    while (parts.next()) |part| {
+        if (std.mem.startsWith(u8, part, "language-") and part.len > "language-".len) return part["language-".len..];
+    }
+    return null;
+}
+
+fn renderCodeBlock(allocator: std.mem.Allocator, code_tag: []const u8, language: []const u8, code_html: []const u8) ![]const u8 {
+    const class_language = try codeLanguageClass(allocator, language);
+    defer allocator.free(class_language);
+    const kind = codeHighlightKind(language);
+    const highlighted = if (kind) |highlight_kind| try highlightCodeTokens(allocator, code_html, highlight_kind) else try allocator.dupe(u8, code_html);
+    defer allocator.free(highlighted);
+
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("<pre class=\"zlog-code");
+    if (class_language.len > 0) try out.print(" zlog-code-language-{s}", .{class_language});
+    try out.appendSlice("\"");
+    if (language.len > 0) {
+        try out.appendSlice(" data-z-language=\"");
+        try appendEscaped(&out, language);
+        try out.append('"');
+    }
+    try out.appendSlice(" data-z-highlight=\"");
+    try out.appendSlice(if (kind != null) "builtin" else "plain");
+    try out.appendSlice("\"><code");
+    try out.appendSlice(code_tag["<code".len .. code_tag.len - 1]);
+    if (language.len > 0) {
+        try out.appendSlice(" data-z-language=\"");
+        try appendEscaped(&out, language);
+        try out.append('"');
+    }
+    try out.appendSlice(" data-z-highlight=\"");
+    try out.appendSlice(if (kind != null) "builtin" else "plain");
+    try out.appendSlice("\">");
+    try out.appendSlice(highlighted);
+    try out.appendSlice("</code></pre>");
+    return out.toOwnedSlice();
+}
+
+fn codeLanguageClass(allocator: std.mem.Allocator, language: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    for (language) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
+            try out.append(std.ascii.toLower(c));
+        } else {
+            try out.append('-');
+        }
+    }
+    return out.toOwnedSlice();
+}
+
+fn codeHighlightKind(language: []const u8) ?CodeHighlightKind {
+    if (std.ascii.eqlIgnoreCase(language, "zig")) return .zig;
+    if (std.ascii.eqlIgnoreCase(language, "js") or std.ascii.eqlIgnoreCase(language, "javascript") or std.ascii.eqlIgnoreCase(language, "ts") or std.ascii.eqlIgnoreCase(language, "typescript")) return .javascript;
+    if (std.ascii.eqlIgnoreCase(language, "sh") or std.ascii.eqlIgnoreCase(language, "shell") or std.ascii.eqlIgnoreCase(language, "bash")) return .shell;
+    return null;
+}
+
+fn highlightCodeTokens(allocator: std.mem.Allocator, code_html: []const u8, kind: CodeHighlightKind) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    while (i < code_html.len) {
+        if (startsCodeComment(code_html, i, kind)) |_| {
+            const end = findLineEnd(code_html, i);
+            try appendCodeToken(&out, "comment", code_html[i..end]);
+            i = end;
+            continue;
+        }
+        const c = code_html[i];
+        if (c == '"' or c == '\'') {
+            const end = findCodeStringEnd(code_html, i, c);
+            try appendCodeToken(&out, "string", code_html[i..end]);
+            i = end;
+            continue;
+        }
+        if (std.ascii.isDigit(c)) {
+            const end = scanCodeNumber(code_html, i);
+            try appendCodeToken(&out, "number", code_html[i..end]);
+            i = end;
+            continue;
+        }
+        if (isCodeIdentStart(c)) {
+            const end = scanCodeIdentifier(code_html, i);
+            const ident = code_html[i..end];
+            if (isCodeKeyword(kind, ident)) {
+                try appendCodeToken(&out, "keyword", ident);
+            } else {
+                try out.appendSlice(ident);
+            }
+            i = end;
+            continue;
+        }
+        try out.append(c);
+        i += 1;
+    }
+    return out.toOwnedSlice();
+}
+
+fn startsCodeComment(code_html: []const u8, index: usize, kind: CodeHighlightKind) ?usize {
+    if (kind == .shell and code_html[index] == '#') return 1;
+    if (index + 1 < code_html.len and code_html[index] == '/' and code_html[index + 1] == '/') return 2;
+    return null;
+}
+
+fn findLineEnd(text: []const u8, start: usize) usize {
+    return if (std.mem.indexOfScalar(u8, text[start..], '\n')) |idx| start + idx else text.len;
+}
+
+fn findCodeStringEnd(text: []const u8, start: usize, quote: u8) usize {
+    var i = start + 1;
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\\' and i + 1 < text.len) {
+            i += 1;
+            continue;
+        }
+        if (text[i] == quote) return i + 1;
+        if (text[i] == '\n') return i;
+    }
+    return text.len;
+}
+
+fn scanCodeNumber(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_' or text[i] == '.')) i += 1;
+    return i;
+}
+
+fn isCodeIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn scanCodeIdentifier(text: []const u8, start: usize) usize {
+    var i = start;
+    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) i += 1;
+    return i;
+}
+
+fn isCodeKeyword(kind: CodeHighlightKind, ident: []const u8) bool {
+    return switch (kind) {
+        .zig => isAnyKeyword(ident, &.{ "const", "var", "fn", "pub", "return", "try", "catch", "defer", "if", "else", "while", "for", "switch", "struct", "enum", "union", "error", "orelse", "undefined", "true", "false", "null" }),
+        .javascript => isAnyKeyword(ident, &.{ "const", "let", "var", "function", "return", "if", "else", "while", "for", "class", "import", "export", "from", "async", "await", "type", "interface", "true", "false", "null", "undefined" }),
+        .shell => isAnyKeyword(ident, &.{ "if", "then", "else", "elif", "fi", "for", "do", "done", "case", "esac", "function", "export", "local" }),
+    };
+}
+
+fn isAnyKeyword(ident: []const u8, keywords: []const []const u8) bool {
+    for (keywords) |keyword| {
+        if (std.mem.eql(u8, ident, keyword)) return true;
+    }
+    return false;
+}
+
+fn appendCodeToken(out: *std.array_list.Managed(u8), class: []const u8, value: []const u8) !void {
+    try out.appendSlice("<span class=\"zlog-token zlog-token-");
+    try out.appendSlice(class);
+    try out.appendSlice("\">");
+    try out.appendSlice(value);
+    try out.appendSlice("</span>");
 }
 
 fn collectCmarkHeadings(allocator: std.mem.Allocator, root: *cmark.node, headings: *std.array_list.Managed(Heading)) !void {
@@ -2841,6 +3035,12 @@ fn renderHead(allocator: std.mem.Allocator, site: SiteConfig, routes: RouteGraph
         \\@media (prefers-reduced-motion: reduce) { ::view-transition-group(*) { animation-duration: 0.01ms; } }
         \\body { max-width: 72ch; margin: 3rem auto; padding: 0 1rem; font: 16px/1.6 system-ui, sans-serif; }
         \\img { max-width: 100%; height: auto; }
+        \\pre.zlog-code { overflow-x: auto; padding: 1rem; border-radius: 6px; background: #111827; color: #e5e7eb; }
+        \\pre.zlog-code code { font: 0.9375rem/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; }
+        \\.zlog-token-keyword { color: #93c5fd; }
+        \\.zlog-token-string { color: #86efac; }
+        \\.zlog-token-number { color: #fbbf24; }
+        \\.zlog-token-comment { color: #9ca3af; }
         \\</style>
         \\
     );
@@ -4604,7 +4804,24 @@ test "markdown renderer handles fenced code tables and emphasis" {
     defer std.testing.allocator.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "<table>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "language-zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "class=\"zlog-code zlog-code-language-zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-z-highlight=\"builtin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "zlog-token-keyword\">const</span>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "<strong>zlog</strong>") != null);
+}
+
+test "markdown renderer falls back safely for unsupported code languages" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\```mermaid
+        \\graph TD
+        \\  A --> B
+        \\```
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "language-mermaid") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-z-language=\"mermaid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "data-z-highlight=\"plain\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "zlog-token") == null);
 }
 
 test "markdown renderer enables gfm strikethrough task lists and footnotes" {
