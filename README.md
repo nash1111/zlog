@@ -25,6 +25,8 @@ zig build release-local
 
 Release archive naming is documented in `docs/releases.md`.
 
+The proposed plugin hook shape is documented in `docs/plugins.md`.
+
 ## Continuous Integration
 
 Pull requests run the GitHub Actions workflow in `.github/workflows/ci.yml`. It
