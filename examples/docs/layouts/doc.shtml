@@ -4,15 +4,21 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title z-text="page.full_title"></title>
+  <link rel="stylesheet" href="/docs.css">
   <template z-replace="zlog.head"></template>
 </head>
 <body>
-  <header><a href="/" data-z-prefetch="hover" z-text="site.title"></a></header>
-  <article>
-    <h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1>
-    <p><time z-text="page.date"></time> <span z-replace="page.taxonomies"></span></p>
-    <template z-replace="content"></template>
-  </article>
+  <template z-include="partials/docs-header.shtml"></template>
+  <div class="docs-layout">
+    <template z-include="partials/docs-sidebar.shtml"></template>
+    <main class="docs-content">
+      <article>
+        <h1 z-text="page.title" z-attr:z-transition-name="page.transition"></h1>
+        <p><time z-text="page.date"></time> <span z-replace="page.taxonomies"></span></p>
+        <template z-replace="content"></template>
+      </article>
+    </main>
+  </div>
   <template z-replace="zlog.runtime"></template>
 </body>
 </html>

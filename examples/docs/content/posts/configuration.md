@@ -17,3 +17,7 @@
 | `permalink` | Post URL pattern |
 
 Use absolute `site.url` values for RSS and sitemap output.
+
+## Previous step
+
+Return to [Getting started](/docs/getting-started/).

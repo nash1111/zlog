@@ -1,0 +1,11 @@
+<header class="docs-header">
+  <a class="docs-brand" href="/" data-z-prefetch="hover" z-text="site.title"></a>
+  <form class="docs-search" role="search" action="/search.json">
+    <input type="search" name="q" aria-label="Search docs" placeholder="Search docs" data-z-search-index="/search.json">
+  </form>
+  <nav aria-label="Documentation links">
+    <a href="/docs/getting-started/" data-z-prefetch="hover">Guide</a>
+    <a href="/docs/configuration/" data-z-prefetch="hover">Reference</a>
+    <a href="/search.json">Index JSON</a>
+  </nav>
+</header>
