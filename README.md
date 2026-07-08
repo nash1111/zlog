@@ -107,6 +107,8 @@ Supported bindings are `site.title`, `page.title`, `page.full_title`,
 categories, and series. `z-replace="pagination"` inserts generated pagination
 navigation when a listing spans multiple pages. Legacy `{{...}}` tokens are
 rejected during template rendering.
+`zlog check` also validates rendered HTML and rejects duplicate
+`view-transition-name` values within the same page.
 
 ## Navigation hints
 
