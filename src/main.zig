@@ -99,7 +99,7 @@ const Page = struct {
     is_post: bool,
 };
 
-const RouteKind = enum { page, post, index_page, tag, tag_page, taxonomy, taxonomy_page, archive, archive_page, rss, sitemap, static_asset };
+const RouteKind = enum { page, post, index_page, tag, tag_page, taxonomy, taxonomy_page, archive, archive_page, rss, sitemap, search_index, static_asset };
 
 const Route = struct {
     kind: RouteKind,
@@ -348,6 +348,10 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     const sitemap_xml = try renderSitemap(allocator, routes, pages.items, site);
     defer allocator.free(sitemap_xml);
     try writeAll(allocator, sitemap_route.out_path, sitemap_xml);
+    const search_route = routes.firstByKind(.search_index) orelse return fail("missing search index route", .{});
+    const search_json = try renderSearchIndex(allocator, pages.items);
+    defer allocator.free(search_json);
+    try writeAll(allocator, search_route.out_path, search_json);
     try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
 }
 
@@ -2234,6 +2238,7 @@ fn buildRouteGraph(allocator: std.mem.Allocator, dir: []const u8, site: SiteConf
     }
     try graph.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "rss.xml" })) });
     try graph.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = try graph.own(try join(allocator, &.{ out_dir, "sitemap.xml" })) });
+    try graph.add(.{ .kind = .search_index, .url = "/search.json", .out_path = try graph.own(try join(allocator, &.{ out_dir, "search.json" })) });
 
     const static_dir = try join(allocator, &.{ dir, "static" });
     defer allocator.free(static_dir);
@@ -2303,7 +2308,7 @@ fn buildAssetGraph(allocator: std.mem.Allocator, pages: []Page, routes: RouteGra
     for (routes.routes.items) |route| {
         switch (route.kind) {
             .static_asset => try addRouteAsset(allocator, &graph, .site_asset, "", route),
-            .page, .post, .index_page, .tag, .tag_page, .taxonomy, .taxonomy_page, .archive, .archive_page, .rss, .sitemap => try addRouteAsset(allocator, &graph, .build_asset, routeOwnerPath(pages, route), route),
+            .page, .post, .index_page, .tag, .tag_page, .taxonomy, .taxonomy_page, .archive, .archive_page, .rss, .sitemap, .search_index => try addRouteAsset(allocator, &graph, .build_asset, routeOwnerPath(pages, route), route),
         }
     }
 
@@ -3433,6 +3438,107 @@ fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]c
     return out.toOwnedSlice();
 }
 
+fn renderSearchIndex(allocator: std.mem.Allocator, pages: []Page) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    try out.appendSlice("{\"version\":1,\"items\":[");
+    var wrote = false;
+    for (pages) |page| {
+        if (page.fm.draft) continue;
+        const body = try htmlToSearchText(allocator, page.html);
+        defer allocator.free(body);
+        if (wrote) try out.append(',');
+        wrote = true;
+        try out.appendSlice("{\"title\":\"");
+        try appendJsonEscaped(&out, page.fm.title);
+        try out.appendSlice("\",\"url\":\"");
+        try appendJsonEscaped(&out, page.url);
+        try out.appendSlice("\",\"date\":\"");
+        try appendJsonEscaped(&out, page.fm.date);
+        try out.appendSlice("\",\"updated\":\"");
+        try appendJsonEscaped(&out, page.fm.updated);
+        try out.appendSlice("\",\"body\":\"");
+        try appendJsonEscaped(&out, body);
+        try out.appendSlice("\",\"tags\":");
+        try appendJsonStringArray(&out, page.fm.tags);
+        try out.appendSlice(",\"categories\":");
+        try appendJsonStringArray(&out, page.fm.categories);
+        try out.appendSlice(",\"series\":");
+        try appendJsonStringArray(&out, page.fm.series);
+        try out.append('}');
+    }
+    try out.appendSlice("]}\n");
+    return out.toOwnedSlice();
+}
+
+fn appendJsonStringArray(out: *std.array_list.Managed(u8), values: []const []const u8) !void {
+    try out.append('[');
+    for (values, 0..) |value, index| {
+        if (index > 0) try out.append(',');
+        try out.append('"');
+        try appendJsonEscaped(out, value);
+        try out.append('"');
+    }
+    try out.append(']');
+}
+
+fn htmlToSearchText(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
+    errdefer out.deinit();
+    var i: usize = 0;
+    var last_space = true;
+    while (i < html.len) {
+        if (html[i] == '<') {
+            const end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+            appendSearchSpace(&out, &last_space) catch |err| return err;
+            i = end + 1;
+            continue;
+        }
+        if (html[i] == '&') {
+            if (htmlEntityAt(html[i..])) |entity| {
+                try appendSearchTextSlice(&out, entity.value, &last_space);
+                i += entity.len;
+                continue;
+            }
+        }
+        try appendSearchTextByte(&out, html[i], &last_space);
+        i += 1;
+    }
+    while (out.items.len > 0 and out.items[out.items.len - 1] == ' ') out.items.len -= 1;
+    return out.toOwnedSlice();
+}
+
+const HtmlEntity = struct {
+    value: []const u8,
+    len: usize,
+};
+
+fn htmlEntityAt(text: []const u8) ?HtmlEntity {
+    if (std.mem.startsWith(u8, text, "&amp;")) return .{ .value = "&", .len = 5 };
+    if (std.mem.startsWith(u8, text, "&lt;")) return .{ .value = "<", .len = 4 };
+    if (std.mem.startsWith(u8, text, "&gt;")) return .{ .value = ">", .len = 4 };
+    if (std.mem.startsWith(u8, text, "&quot;")) return .{ .value = "\"", .len = 6 };
+    if (std.mem.startsWith(u8, text, "&apos;")) return .{ .value = "'", .len = 6 };
+    if (std.mem.startsWith(u8, text, "&nbsp;")) return .{ .value = " ", .len = 6 };
+    return null;
+}
+
+fn appendSearchTextSlice(out: *std.array_list.Managed(u8), text: []const u8, last_space: *bool) !void {
+    for (text) |c| try appendSearchTextByte(out, c, last_space);
+}
+
+fn appendSearchTextByte(out: *std.array_list.Managed(u8), c: u8, last_space: *bool) !void {
+    if (std.ascii.isWhitespace(c)) return appendSearchSpace(out, last_space);
+    try out.append(c);
+    last_space.* = false;
+}
+
+fn appendSearchSpace(out: *std.array_list.Managed(u8), last_space: *bool) !void {
+    if (last_space.*) return;
+    try out.append(' ');
+    last_space.* = true;
+}
+
 fn absoluteSiteUrl(allocator: std.mem.Allocator, site: SiteConfig, path: []const u8) ![]const u8 {
     if (hasUrlScheme(path)) return allocator.dupe(u8, path);
     const base = std.mem.trimEnd(u8, site.url, "/");
@@ -3605,7 +3711,7 @@ fn includeInSitemap(route: Route) bool {
 fn includeInHtmlRouteManifest(route: Route) bool {
     return switch (route.kind) {
         .page, .post, .index_page, .tag, .tag_page, .taxonomy, .taxonomy_page, .archive, .archive_page => true,
-        .rss, .sitemap, .static_asset => false,
+        .rss, .sitemap, .search_index, .static_asset => false,
     };
 }
 
@@ -3614,7 +3720,7 @@ fn sitemapLastmod(allocator: std.mem.Allocator, route: Route, pages: []Page) !?[
         .page, .post => if (findPageByUrl(pages, route.url)) |page| reliablePageTimestamp(page) else null,
         .index_page, .archive, .archive_page => latestReliableTimestamp(pages),
         .tag, .tag_page, .taxonomy, .taxonomy_page => try latestReliableTimestampForTaxonomyRoute(allocator, route.url, pages),
-        .rss, .sitemap, .static_asset => null,
+        .rss, .sitemap, .search_index, .static_asset => null,
     };
 }
 
@@ -4159,6 +4265,42 @@ test "draft pages are excluded from published outputs" {
     defer std.testing.allocator.free(rss);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Live") != null);
     try std.testing.expect(std.mem.indexOf(u8, rss, "Draft") == null);
+    const search = try renderSearchIndex(std.testing.allocator, pages[0..]);
+    defer std.testing.allocator.free(search);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"title\":\"Live\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "Draft") == null);
+}
+
+test "search index includes content text and taxonomy fields" {
+    var pages = [_]Page{
+        .{
+            .source_path = "content/index.md",
+            .slug = "index",
+            .url = "/",
+            .fm = .{ .title = "Home & Docs", .tags = &[_][]const u8{"home"} },
+            .markdown = "",
+            .html = "<h1>Home &amp; Docs</h1><p>Find <strong>local</strong> content.</p>",
+            .is_post = false,
+        },
+        .{
+            .source_path = "content/posts/live.md",
+            .slug = "live",
+            .url = "/live/",
+            .fm = .{ .title = "Live", .date = "2026-06-27", .tags = &[_][]const u8{ "zig", "ssg" }, .categories = &[_][]const u8{"Engineering"}, .series = &[_][]const u8{"Building zlog"} },
+            .markdown = "",
+            .html = "<p>Body with &quot;quotes&quot; and tags.</p>",
+            .is_post = true,
+        },
+    };
+    const search = try renderSearchIndex(std.testing.allocator, pages[0..]);
+    defer std.testing.allocator.free(search);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"title\":\"Home & Docs\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"body\":\"Home & Docs Find local content.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"body\":\"Body with \\\"quotes\\\" and tags.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"tags\":[\"zig\",\"ssg\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"categories\":[\"Engineering\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, search, "\"series\":[\"Building zlog\"]") != null);
 }
 
 test "rss output uses absolute escaped item metadata" {
@@ -4219,6 +4361,7 @@ test "sitemap output uses absolute urls and reliable lastmod" {
     try routes.add(.{ .kind = .archive, .url = "/archive/", .out_path = "" });
     try routes.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = "" });
     try routes.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = "" });
+    try routes.add(.{ .kind = .search_index, .url = "/search.json", .out_path = "" });
     try routes.add(.{ .kind = .static_asset, .url = "/app.css", .out_path = "" });
 
     const sitemap = try renderSitemap(std.testing.allocator, routes, pages[0..], .{ .url = "https://example.com/blog/" });
@@ -4233,6 +4376,7 @@ test "sitemap output uses absolute urls and reliable lastmod" {
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/draft/") == null);
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/rss.xml") == null);
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/sitemap.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/search.json") == null);
     try std.testing.expect(std.mem.indexOf(u8, sitemap, "https://example.com/blog/app.css") == null);
 }
 
@@ -4247,6 +4391,7 @@ test "speculation rules use safe route graph targets" {
     try routes.add(.{ .kind = .archive, .url = "/archive/", .out_path = "" });
     try routes.add(.{ .kind = .rss, .url = "/rss.xml", .out_path = "" });
     try routes.add(.{ .kind = .sitemap, .url = "/sitemap.xml", .out_path = "" });
+    try routes.add(.{ .kind = .search_index, .url = "/search.json", .out_path = "" });
     try routes.add(.{ .kind = .static_asset, .url = "/app.css", .out_path = "" });
     try routes.add(.{ .kind = .page, .url = "https://example.com/offsite/", .out_path = "" });
     try routes.add(.{ .kind = .page, .url = "/admin/?logout=1", .out_path = "" });
@@ -4261,6 +4406,7 @@ test "speculation rules use safe route graph targets" {
     try std.testing.expect(std.mem.indexOf(u8, rules, "a[download],a[target]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rules, "/rss.xml") == null);
     try std.testing.expect(std.mem.indexOf(u8, rules, "/sitemap.xml") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rules, "/search.json") == null);
     try std.testing.expect(std.mem.indexOf(u8, rules, "/app.css") == null);
     try std.testing.expect(std.mem.indexOf(u8, rules, "https://example.com/offsite/") == null);
     try std.testing.expect(std.mem.indexOf(u8, rules, "/admin/?logout=1") == null);
@@ -4293,6 +4439,7 @@ test "route graph centralizes published routes and static assets" {
     try std.testing.expect(routes.containsUrl("/archive/"));
     try std.testing.expect(routes.containsUrl("/rss.xml"));
     try std.testing.expect(routes.containsUrl("/sitemap.xml"));
+    try std.testing.expect(routes.containsUrl("/search.json"));
     try std.testing.expect(routes.containsUrl("/app.css"));
     try std.testing.expect(routes.containsUrl("/assets/icons/logo.bin"));
 }
