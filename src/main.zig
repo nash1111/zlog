@@ -1032,7 +1032,10 @@ fn splitFrontmatter(text: []const u8) FrontmatterSplit {
 }
 
 fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize, collection: ContentCollection) !Frontmatter {
-    const doc = try parseZiggyFields(allocator, text, path, line_start);
+    const doc = if (looksLikeYamlFrontmatter(text))
+        try parseYamlFields(allocator, text, path, line_start)
+    else
+        try parseZiggyFields(allocator, text, path, line_start);
     defer allocator.free(doc.fields);
     return Frontmatter{
         .title = try ziggyRequiredString(doc, path, line_start, "title"),
@@ -1047,6 +1050,224 @@ fn parseFrontmatter(allocator: std.mem.Allocator, text: []const u8, path: []cons
         .prefetch = try ziggyString(doc, path, "prefetch", ""),
         .transition = try ziggyString(doc, path, "transition", ""),
     };
+}
+
+fn looksLikeYamlFrontmatter(text: []const u8) bool {
+    var cursor: usize = 0;
+    while (nextSourceLine(text, cursor)) |line| {
+        cursor = line.next;
+        const trimmed = std.mem.trim(u8, line.text, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        return trimmed[0] != '.';
+    }
+    return false;
+}
+
+const SourceLine = struct {
+    text: []const u8,
+    next: usize,
+};
+
+fn nextSourceLine(text: []const u8, cursor: usize) ?SourceLine {
+    if (cursor >= text.len) return null;
+    if (std.mem.indexOfScalar(u8, text[cursor..], '\n')) |rel_end| {
+        var line = text[cursor .. cursor + rel_end];
+        if (std.mem.endsWith(u8, line, "\r")) line = line[0 .. line.len - 1];
+        return .{ .text = line, .next = cursor + rel_end + 1 };
+    }
+    var line = text[cursor..];
+    if (std.mem.endsWith(u8, line, "\r")) line = line[0 .. line.len - 1];
+    return .{ .text = line, .next = text.len };
+}
+
+fn parseYamlFields(allocator: std.mem.Allocator, text: []const u8, path: []const u8, line_start: usize) !ZiggyDoc {
+    var fields = std.array_list.Managed(ZiggyField).init(allocator);
+    var cursor: usize = 0;
+    var line_number = line_start;
+
+    while (nextSourceLine(text, cursor)) |line| {
+        cursor = line.next;
+        const raw = line.text;
+        const trimmed_left = std.mem.trimStart(u8, raw, " \t");
+        const column = raw.len - trimmed_left.len + 1;
+        const trimmed = std.mem.trimEnd(u8, trimmed_left, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            line_number += 1;
+            continue;
+        }
+        if (trimmed[0] == '-') {
+            try failAtHint(path, line_number, column, "unexpected YAML sequence item", .{}, "Put sequence items under a supported array field such as tags, categories, or series.");
+            unreachable;
+        }
+
+        const colon_index = std.mem.indexOfScalar(u8, trimmed, ':') orelse {
+            try failAtHint(path, line_number, column, "expected ':' in YAML frontmatter", .{}, "Use key: value syntax, or use native Ziggy fields such as .title = \"...\".");
+            unreachable;
+        };
+        const name = std.mem.trim(u8, trimmed[0..colon_index], " \t");
+        if (!validYamlFieldName(name)) {
+            try failAtHint(path, line_number, column, "invalid YAML frontmatter field '{s}'", .{name}, "Use plain field names such as title, date, tags, categories, or series.");
+            unreachable;
+        }
+
+        const field_line = line_number;
+        const raw_value = trimmed[colon_index + 1 ..];
+        const value_text = trimYamlValue(raw_value);
+        const value = if (value_text.len == 0 and isFrontmatterArrayField(name)) blk: {
+            const parsed = try parseYamlBlockStringArray(allocator, text, path, &cursor, &line_number);
+            break :blk ZiggyValue{ .string_array = parsed };
+        } else try parseYamlValue(allocator, name, value_text, path, line_number, column + colon_index + 2);
+        try fields.append(.{ .name = name, .value = value, .line = field_line, .column = column });
+        line_number += 1;
+    }
+
+    return .{ .fields = try fields.toOwnedSlice() };
+}
+
+fn validYamlFieldName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
+fn isFrontmatterArrayField(name: []const u8) bool {
+    return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "categories") or std.mem.eql(u8, name, "series");
+}
+
+fn parseYamlValue(allocator: std.mem.Allocator, name: []const u8, value_text: []const u8, path: []const u8, line: usize, column: usize) !ZiggyValue {
+    if (value_text.len == 0) return .{ .string = "" };
+    if (value_text[0] == '[') return .{ .string_array = try parseYamlInlineStringArray(allocator, value_text, path, line, column) };
+    if (std.mem.eql(u8, value_text, "true")) return .{ .bool = true };
+    if (std.mem.eql(u8, value_text, "false")) return .{ .bool = false };
+    if (value_text[0] == '{') {
+        try failAtHint(path, line, column, "unsupported YAML value for {s}", .{name}, "Only scalar strings, booleans, and string arrays can be imported.");
+        unreachable;
+    }
+    return .{ .string = try parseYamlStringScalar(value_text, path, line, column) };
+}
+
+fn trimYamlValue(raw: []const u8) []const u8 {
+    return std.mem.trim(u8, stripYamlComment(raw), " \t");
+}
+
+fn stripYamlComment(raw: []const u8) []const u8 {
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (quote != 0) {
+            if (c == '\\' and quote == '"' and i + 1 < raw.len) {
+                i += 1;
+                continue;
+            }
+            if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' or c == '\'') {
+            quote = c;
+            continue;
+        }
+        if (c == '#' and (i == 0 or raw[i - 1] == ' ' or raw[i - 1] == '\t')) return raw[0..i];
+    }
+    return raw;
+}
+
+fn parseYamlStringScalar(value_text: []const u8, path: []const u8, line: usize, column: usize) ![]const u8 {
+    if (value_text.len == 0) return "";
+    const quote = value_text[0];
+    if (quote == '"' or quote == '\'') {
+        if (value_text.len < 2 or value_text[value_text.len - 1] != quote) {
+            try failAtHint(path, line, column, "unterminated YAML string", .{}, "Close the string with a matching quote.");
+            unreachable;
+        }
+        return value_text[1 .. value_text.len - 1];
+    }
+    if (value_text[0] == '[' or value_text[0] == ']') {
+        try failAtHint(path, line, column, "unsupported YAML scalar", .{}, "Use a plain string or a quoted string.");
+        unreachable;
+    }
+    return value_text;
+}
+
+fn parseYamlInlineStringArray(allocator: std.mem.Allocator, value_text: []const u8, path: []const u8, line: usize, column: usize) ![]const []const u8 {
+    if (value_text.len < 2 or value_text[value_text.len - 1] != ']') {
+        try failAtHint(path, line, column, "unterminated YAML array", .{}, "Close the array with ].");
+        unreachable;
+    }
+    const inner = value_text[1 .. value_text.len - 1];
+    var values = std.array_list.Managed([]const u8).init(allocator);
+    var index: usize = 0;
+    while (index < inner.len) {
+        while (index < inner.len and (inner[index] == ' ' or inner[index] == '\t')) index += 1;
+        if (index >= inner.len) break;
+
+        const item_start = index;
+        var quote: u8 = 0;
+        while (index < inner.len) : (index += 1) {
+            const c = inner[index];
+            if (quote != 0) {
+                if (c == '\\' and quote == '"' and index + 1 < inner.len) {
+                    index += 1;
+                    continue;
+                }
+                if (c == quote) quote = 0;
+                continue;
+            }
+            if (c == '"' or c == '\'') {
+                quote = c;
+                continue;
+            }
+            if (c == ',') break;
+        }
+        if (quote != 0) {
+            try failAtHint(path, line, column + item_start + 1, "unterminated YAML string", .{}, "Close the string with a matching quote.");
+            unreachable;
+        }
+
+        const item = trimYamlValue(inner[item_start..index]);
+        if (item.len == 0) {
+            try failAtHint(path, line, column + item_start + 1, "empty YAML array item", .{}, "Use non-empty string entries.");
+            unreachable;
+        }
+        try values.append(try parseYamlStringScalar(item, path, line, column + item_start + 1));
+        if (index < inner.len and inner[index] == ',') index += 1;
+    }
+    return values.toOwnedSlice();
+}
+
+fn parseYamlBlockStringArray(allocator: std.mem.Allocator, text: []const u8, path: []const u8, cursor: *usize, line_number: *usize) ![]const []const u8 {
+    var values = std.array_list.Managed([]const u8).init(allocator);
+    var current_cursor = cursor.*;
+    var current_line = line_number.* + 1;
+
+    while (nextSourceLine(text, current_cursor)) |line| {
+        const raw = line.text;
+        const trimmed_left = std.mem.trimStart(u8, raw, " \t");
+        const column = raw.len - trimmed_left.len + 1;
+        const trimmed = std.mem.trimEnd(u8, trimmed_left, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') {
+            current_cursor = line.next;
+            current_line += 1;
+            continue;
+        }
+        if (column == 1 or trimmed[0] != '-') break;
+
+        const item_text = trimYamlValue(trimmed[1..]);
+        if (item_text.len == 0) {
+            try failAtHint(path, current_line, column, "empty YAML sequence item", .{}, "Use non-empty string entries.");
+            unreachable;
+        }
+        try values.append(try parseYamlStringScalar(item_text, path, current_line, column + 1));
+        current_cursor = line.next;
+        current_line += 1;
+    }
+
+    cursor.* = current_cursor;
+    line_number.* = current_line - 1;
+    return values.toOwnedSlice();
 }
 
 const ZiggyValue = union(enum) {
@@ -3509,6 +3730,45 @@ test "frontmatter parser reads title tags and draft" {
     try std.testing.expect(!fm.draft);
 }
 
+test "frontmatter parser imports YAML migration fields" {
+    const text =
+        \\title: YAML Post
+        \\slug: yaml-post
+        \\date: 2026-06-27
+        \\updated: "2026-06-28"
+        \\tags: [zig, "ssg"]
+        \\categories:
+        \\  - Engineering
+        \\  - Notes
+        \\series:
+        \\  - Building zlog
+        \\layout: post.shtml
+        \\draft: true
+        \\prefetch: tap
+        \\transition: post-title:yaml
+    ;
+    const fm = try parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post);
+    defer std.testing.allocator.free(fm.tags);
+    defer std.testing.allocator.free(fm.categories);
+    defer std.testing.allocator.free(fm.series);
+    try std.testing.expectEqualStrings("YAML Post", fm.title);
+    try std.testing.expectEqualStrings("yaml-post", fm.slug);
+    try std.testing.expectEqualStrings("2026-06-27", fm.date);
+    try std.testing.expectEqualStrings("2026-06-28", fm.updated);
+    try std.testing.expectEqual(@as(usize, 2), fm.tags.len);
+    try std.testing.expectEqualStrings("zig", fm.tags[0]);
+    try std.testing.expectEqualStrings("ssg", fm.tags[1]);
+    try std.testing.expectEqual(@as(usize, 2), fm.categories.len);
+    try std.testing.expectEqualStrings("Engineering", fm.categories[0]);
+    try std.testing.expectEqualStrings("Notes", fm.categories[1]);
+    try std.testing.expectEqual(@as(usize, 1), fm.series.len);
+    try std.testing.expectEqualStrings("Building zlog", fm.series[0]);
+    try std.testing.expectEqualStrings("post.shtml", fm.layout);
+    try std.testing.expect(fm.draft);
+    try std.testing.expectEqualStrings("tap", fm.prefetch);
+    try std.testing.expectEqualStrings("post-title:yaml", fm.transition);
+}
+
 test "post permalink policy supports date parts and custom slugs" {
     runtime_io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -3554,6 +3814,15 @@ test "frontmatter parser rejects schema type mismatches" {
         \\.title = "Post",
         \\.date = "2026-06-27",
         \\.tags = "zig",
+    ;
+    try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post));
+}
+
+test "frontmatter parser rejects YAML scalar arrays" {
+    const text =
+        \\title: Post
+        \\date: 2026-06-27
+        \\tags: zig
     ;
     try std.testing.expectError(error.InvalidSite, parseFrontmatter(std.testing.allocator, text, "post.md", 1, .post));
 }
