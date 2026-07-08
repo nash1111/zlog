@@ -185,13 +185,17 @@ features used by zlog:
 
 - headings with generated IDs
 - links, images, autolinks, lists, and blockquotes
-- fenced code blocks with language classes
+- fenced code blocks with language classes, `zlog-code` wrappers, and safe highlighting metadata
 - pipe tables
 - emphasis, strong emphasis, and strikethrough
 - task lists and footnotes
 
 zlog adds stable heading IDs and `data-z-prefetch` placeholders after Markdown
-rendering.
+rendering. Code blocks keep the cmark-gfm `language-*` class. Zig,
+JavaScript/TypeScript, and shell blocks also receive lightweight built-in token
+spans; unsupported languages keep escaped plain code with
+`data-z-highlight="plain"` so project CSS or a later external highlighter can
+style them safely.
 
 ## Layouts
 
