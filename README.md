@@ -11,7 +11,7 @@ Implemented now:
 - `zlog build [dir]` for index, individual posts, tag pages, archive pages, RSS, sitemap, static assets, cmark-gfm Markdown rendering, `data-z-prefetch`, speculation rules, prefetch fallback runtime, and cross-document view-transition CSS.
 - `zlog dev [dir] [port]` to serve the generated `public/` output on localhost and rebuild when project files change.
 
-Not implemented yet: external SuperHTML integration, live reload overlay, image dimension probing, plugin ecosystem, SSR, MDX, islands, or client router.
+Not implemented yet: external SuperHTML integration, plugin ecosystem, SSR, MDX, islands, or client router.
 
 ## Build and test
 
@@ -56,7 +56,7 @@ RSS and sitemap output use `.url` for absolute URLs. RSS, generated metadata, an
 Post URLs use `.permalink`; supported placeholders are `:slug`, `:year`, `:month`, and `:day`.
 Listing pages use `.page_size`; additional index, tag, and archive pages are generated as needed.
 
-`zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Existing output stays served if a rebuild fails.
+`zlog dev` watches `zlog.ziggy`, `content/`, `layouts/`, and `static/`, then runs a full rebuild when any watched file changes. Browser pages reload after successful rebuilds; failed rebuilds are surfaced in the page while existing output stays served.
 
 ## Frontmatter
 

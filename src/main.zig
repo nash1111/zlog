@@ -216,6 +216,8 @@ const AssetGraph = struct {
 const CliError = error{Usage};
 const default_dev_port: u16 = 1111;
 const watch_poll_interval_ms: i64 = 750;
+const live_reload_poll_interval_ms: i64 = 250;
+const live_reload_max_polls: usize = 240;
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -351,17 +353,18 @@ fn cmdDev(allocator: std.mem.Allocator, dir: []const u8, port: u16) !void {
     try cmdBuild(allocator, dir);
     const site = try loadSite(allocator, dir);
     const out_dir = try join(allocator, &.{ dir, site.out_dir });
-    try startDevWatcher(allocator, dir);
-    try serveDirectory(allocator, out_dir, port);
+    var reload_state = DevReloadState.init();
+    try startDevWatcher(allocator, dir, &reload_state);
+    try serveDirectory(allocator, out_dir, port, &reload_state);
 }
 
-fn startDevWatcher(allocator: std.mem.Allocator, dir: []const u8) !void {
-    var thread = try std.Thread.spawn(.{}, watchAndRebuild, .{ allocator, dir });
+fn startDevWatcher(allocator: std.mem.Allocator, dir: []const u8, reload_state: *DevReloadState) !void {
+    var thread = try std.Thread.spawn(.{}, watchAndRebuild, .{ allocator, dir, reload_state });
     thread.detach();
     try stdout("watching zlog.ziggy, content, layouts, and static for rebuilds\n", .{});
 }
 
-fn watchAndRebuild(allocator: std.mem.Allocator, dir: []const u8) void {
+fn watchAndRebuild(allocator: std.mem.Allocator, dir: []const u8, reload_state: *DevReloadState) void {
     var site = loadSite(allocator, dir) catch SiteConfig{};
     var previous = projectFingerprint(allocator, dir, site) catch |err| {
         stderr("watch error: initial scan failed: {t}\n", .{err}) catch {};
@@ -381,13 +384,46 @@ fn watchAndRebuild(allocator: std.mem.Allocator, dir: []const u8) void {
         stdout("change detected; rebuilding...\n", .{}) catch {};
         cmdBuild(allocator, dir) catch |err| {
             stderr("watch rebuild failed: {t}\n", .{err}) catch {};
+            reload_state.mark(.failed);
             continue;
         };
         site = loadSite(allocator, dir) catch site;
         previous = projectFingerprint(allocator, dir, site) catch previous;
+        reload_state.mark(.ok);
         stdout("watch rebuild complete\n", .{}) catch {};
     }
 }
+
+const DevBuildStatus = enum(u8) { ok, failed };
+
+const DevReloadSnapshot = struct {
+    version: u64,
+    status: DevBuildStatus,
+};
+
+const DevReloadState = struct {
+    version: std.atomic.Value(u64),
+    status: std.atomic.Value(u8),
+
+    fn init() DevReloadState {
+        return .{
+            .version = .init(1),
+            .status = .init(@intFromEnum(DevBuildStatus.ok)),
+        };
+    }
+
+    fn mark(self: *DevReloadState, status: DevBuildStatus) void {
+        self.status.store(@intFromEnum(status), .release);
+        _ = self.version.fetchAdd(1, .release);
+    }
+
+    fn snapshot(self: *const DevReloadState) DevReloadSnapshot {
+        return .{
+            .version = self.version.load(.acquire),
+            .status = @enumFromInt(self.status.load(.acquire)),
+        };
+    }
+};
 
 fn projectFingerprint(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !u64 {
     var hasher = std.hash.Wyhash.init(0);
@@ -445,7 +481,7 @@ fn hashFileStat(hasher: *std.hash.Wyhash, stat: std.Io.File.Stat) void {
     hasher.update(std.mem.asBytes(&stat.mtime.nanoseconds));
 }
 
-fn serveDirectory(allocator: std.mem.Allocator, root_dir: []const u8, port: u16) !void {
+fn serveDirectory(allocator: std.mem.Allocator, root_dir: []const u8, port: u16, reload_state: *DevReloadState) !void {
     const net = std.Io.net;
     var address = try net.IpAddress.parse("127.0.0.1", port);
     var server = try address.listen(runtime_io, .{ .reuse_address = true });
@@ -456,15 +492,26 @@ fn serveDirectory(allocator: std.mem.Allocator, root_dir: []const u8, port: u16)
     try stdout("press Ctrl+C to stop\n", .{});
 
     while (true) {
-        const stream = server.accept(runtime_io) catch |err| switch (err) {
+        var stream = server.accept(runtime_io) catch |err| switch (err) {
             error.Canceled => return,
             else => return err,
         };
-        try handleDevConnection(allocator, root_dir, stream);
+        var thread = std.Thread.spawn(.{}, handleDevConnectionThread, .{ allocator, root_dir, stream, reload_state }) catch |err| {
+            stream.close(runtime_io);
+            try stderr("dev connection spawn failed: {t}\n", .{err});
+            continue;
+        };
+        thread.detach();
     }
 }
 
-fn handleDevConnection(allocator: std.mem.Allocator, root_dir: []const u8, stream: std.Io.net.Stream) !void {
+fn handleDevConnectionThread(allocator: std.mem.Allocator, root_dir: []const u8, stream: std.Io.net.Stream, reload_state: *DevReloadState) void {
+    handleDevConnection(allocator, root_dir, stream, reload_state) catch |err| {
+        stderr("dev connection failed: {t}\n", .{err}) catch {};
+    };
+}
+
+fn handleDevConnection(allocator: std.mem.Allocator, root_dir: []const u8, stream: std.Io.net.Stream, reload_state: *DevReloadState) !void {
     var connection = stream;
     defer connection.close(runtime_io);
 
@@ -479,11 +526,11 @@ fn handleDevConnection(allocator: std.mem.Allocator, root_dir: []const u8, strea
             error.HttpConnectionClosing => return,
             else => return err,
         };
-        try serveDevRequest(allocator, root_dir, &request);
+        try serveDevRequest(allocator, root_dir, &request, reload_state);
     }
 }
 
-fn serveDevRequest(allocator: std.mem.Allocator, root_dir: []const u8, request: *std.http.Server.Request) !void {
+fn serveDevRequest(allocator: std.mem.Allocator, root_dir: []const u8, request: *std.http.Server.Request, reload_state: *DevReloadState) !void {
     if (request.head.method != .GET and request.head.method != .HEAD) {
         return request.respond("method not allowed\n", .{
             .status = .method_not_allowed,
@@ -495,6 +542,7 @@ fn serveDevRequest(allocator: std.mem.Allocator, root_dir: []const u8, request: 
     }
 
     const target_path = requestTargetPath(request.head.target);
+    if (std.mem.eql(u8, target_path, "/__zlog/events")) return serveLiveReloadEvents(request, reload_state);
     if (!std.mem.startsWith(u8, target_path, "/")) {
         return request.respond("bad request\n", .{
             .status = .bad_request,
@@ -519,13 +567,90 @@ fn serveDevRequest(allocator: std.mem.Allocator, root_dir: []const u8, request: 
     };
     defer allocator.free(data);
 
-    try request.respond(data, .{
+    var injected: ?[]const u8 = null;
+    defer if (injected) |html| allocator.free(html);
+    const response_data = if (isHtmlPath(file_path)) response: {
+        const html = try injectLiveReloadRuntime(allocator, data);
+        injected = html;
+        break :response html;
+    } else data;
+
+    try request.respond(response_data, .{
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = contentTypeForPath(file_path) },
             .{ .name = "Cache-Control", .value = "no-store" },
         },
     });
 }
+
+fn serveLiveReloadEvents(request: *std.http.Server.Request, reload_state: *DevReloadState) !void {
+    var stream_buffer: [1024]u8 = undefined;
+    var body = try request.respondStreaming(&stream_buffer, .{
+        .respond_options = .{
+            .keep_alive = false,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/event-stream; charset=utf-8" },
+                .{ .name = "Cache-Control", .value = "no-store" },
+                .{ .name = "X-Accel-Buffering", .value = "no" },
+            },
+        },
+    });
+
+    var snapshot = reload_state.snapshot();
+    var seen_version = snapshot.version;
+    try writeLiveReloadEvent(&body, "ready", snapshot);
+    try flushLiveReloadEvent(&body);
+
+    var polls: usize = 0;
+    while (polls < live_reload_max_polls) : (polls += 1) {
+        std.Io.Clock.Duration.sleep(.{ .raw = std.Io.Duration.fromMilliseconds(live_reload_poll_interval_ms), .clock = .boot }, runtime_io) catch break;
+        snapshot = reload_state.snapshot();
+        if (snapshot.version != seen_version) {
+            seen_version = snapshot.version;
+            try writeLiveReloadEvent(&body, "reload", snapshot);
+            try flushLiveReloadEvent(&body);
+            if (snapshot.status == .ok) break;
+        } else if (polls > 0 and polls % 40 == 0) {
+            try body.writer.writeAll(": keepalive\n\n");
+            try flushLiveReloadEvent(&body);
+        }
+    }
+    try body.end();
+}
+
+fn flushLiveReloadEvent(body: *std.http.BodyWriter) !void {
+    try body.writer.flush();
+    try body.flush();
+}
+
+fn writeLiveReloadEvent(body: *std.http.BodyWriter, event: []const u8, snapshot: DevReloadSnapshot) !void {
+    try body.writer.print("event: {s}\ndata: {{\"version\":{d},\"status\":\"{s}\"}}\n\n", .{ event, snapshot.version, devBuildStatusText(snapshot.status) });
+}
+
+fn devBuildStatusText(status: DevBuildStatus) []const u8 {
+    return switch (status) {
+        .ok => "ok",
+        .failed => "error",
+    };
+}
+
+fn injectLiveReloadRuntime(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, html, "</body>")) |idx| {
+        var out = std.array_list.Managed(u8).init(allocator);
+        errdefer out.deinit();
+        try out.appendSlice(html[0..idx]);
+        try out.appendSlice(liveReloadRuntime);
+        try out.appendSlice(html[idx..]);
+        return out.toOwnedSlice();
+    }
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ html, liveReloadRuntime });
+}
+
+const liveReloadRuntime =
+    \\<script>
+    \\(()=>{let banner;function show(m){if(!banner){banner=document.createElement('div');banner.id='zlog-live-status';banner.style.cssText='position:fixed;left:12px;bottom:12px;z-index:2147483647;padding:8px 10px;background:#7f1d1d;color:#fff;font:13px system-ui,sans-serif;border-radius:4px;box-shadow:0 4px 12px #0003'}banner.textContent=m||'zlog rebuild failed';document.documentElement.appendChild(banner)}function hide(){if(banner){banner.remove();banner=null}}function onReload(e){const d=JSON.parse(e.data);if(d.status==='ok'){hide();if(e.type==='reload')location.reload()}else show('zlog rebuild failed; waiting for the next save')}function connect(){const es=new EventSource('/__zlog/events');es.addEventListener('ready',onReload);es.addEventListener('reload',onReload);es.onerror=()=>show('zlog live reload disconnected')}if('EventSource'in window)connect()})();
+    \\</script>
+;
 
 fn requestTargetPath(target: []const u8) []const u8 {
     var end = target.len;
@@ -566,6 +691,10 @@ fn contentTypeForPath(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".webp")) return "image/webp";
     if (std.mem.endsWith(u8, path, ".ico")) return "image/x-icon";
     return "application/octet-stream";
+}
+
+fn isHtmlPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm");
 }
 
 const LayoutSource = struct {
@@ -3968,6 +4097,36 @@ test "dev server resolves route paths into public files" {
     defer std.testing.allocator.free(asset);
     try std.testing.expectEqualStrings("public/app.css", asset);
     try std.testing.expectEqualStrings("text/css; charset=utf-8", contentTypeForPath(asset));
+}
+
+test "dev live reload script is injected into html responses" {
+    const html = try injectLiveReloadRuntime(std.testing.allocator, "<html><body><main>Body</main></body></html>");
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "new EventSource('/__zlog/events')") != null);
+    const script_index = std.mem.indexOf(u8, html, "new EventSource").?;
+    const body_index = std.mem.indexOf(u8, html, "</body>").?;
+    try std.testing.expect(script_index < body_index);
+
+    const fragment = try injectLiveReloadRuntime(std.testing.allocator, "<main>Body</main>");
+    defer std.testing.allocator.free(fragment);
+    try std.testing.expect(std.mem.endsWith(u8, fragment, "</script>"));
+}
+
+test "dev reload state records successful and failed rebuilds" {
+    var state = DevReloadState.init();
+    const initial = state.snapshot();
+    try std.testing.expectEqual(DevBuildStatus.ok, initial.status);
+
+    state.mark(.failed);
+    const failed = state.snapshot();
+    try std.testing.expectEqual(DevBuildStatus.failed, failed.status);
+    try std.testing.expect(failed.version > initial.version);
+    try std.testing.expectEqualStrings("error", devBuildStatusText(failed.status));
+
+    state.mark(.ok);
+    const recovered = state.snapshot();
+    try std.testing.expectEqual(DevBuildStatus.ok, recovered.status);
+    try std.testing.expect(recovered.version > failed.version);
 }
 
 test "project fingerprint changes when watched inputs change" {
