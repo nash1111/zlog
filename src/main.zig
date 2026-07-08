@@ -373,31 +373,64 @@ fn startDevWatcher(allocator: std.mem.Allocator, dir: []const u8, reload_state: 
 
 fn watchAndRebuild(allocator: std.mem.Allocator, dir: []const u8, reload_state: *DevReloadState) void {
     var site = loadSite(allocator, dir) catch SiteConfig{};
-    var previous = projectFingerprint(allocator, dir, site) catch |err| {
+    var previous = captureProjectSnapshot(allocator, dir, site) catch |err| {
         stderr("watch error: initial scan failed: {t}\n", .{err}) catch {};
         return;
     };
+    defer previous.deinit();
 
     while (true) {
         std.Io.Clock.Duration.sleep(.{ .raw = std.Io.Duration.fromMilliseconds(watch_poll_interval_ms), .clock = .boot }, runtime_io) catch return;
 
-        const next = projectFingerprint(allocator, dir, site) catch |err| {
+        var next = captureProjectSnapshot(allocator, dir, site) catch |err| {
             stderr("watch error: scan failed: {t}\n", .{err}) catch {};
             continue;
         };
-        if (next == previous) continue;
-        previous = next;
-
-        stdout("change detected; rebuilding...\n", .{}) catch {};
-        cmdBuild(allocator, dir) catch |err| {
-            stderr("watch rebuild failed: {t}\n", .{err}) catch {};
-            reload_state.mark(.failed);
+        const changes = changedFiles(allocator, previous, next) catch |err| {
+            next.deinit();
+            stderr("watch error: diff failed: {t}\n", .{err}) catch {};
             continue;
         };
-        site = loadSite(allocator, dir) catch site;
-        previous = projectFingerprint(allocator, dir, site) catch previous;
-        reload_state.mark(.ok);
-        stdout("watch rebuild complete\n", .{}) catch {};
+        defer freeFileChanges(allocator, changes);
+        if (changes.len == 0) {
+            next.deinit();
+            continue;
+        }
+
+        switch (planIncrementalBuild(changes)) {
+            .static_assets => {
+                stdout("change detected; copying {d} static asset(s)...\n", .{changes.len}) catch {};
+                copyChangedStaticAssets(allocator, dir, site, changes) catch |err| {
+                    next.deinit();
+                    stderr("watch rebuild failed: {t}\n", .{err}) catch {};
+                    reload_state.mark(.failed);
+                    continue;
+                };
+                previous.deinit();
+                previous = next;
+                reload_state.mark(.ok);
+                stdout("watch static asset update complete\n", .{}) catch {};
+            },
+            .full => {
+                next.deinit();
+                stdout("change detected; rebuilding...\n", .{}) catch {};
+                cmdBuild(allocator, dir) catch |err| {
+                    stderr("watch rebuild failed: {t}\n", .{err}) catch {};
+                    reload_state.mark(.failed);
+                    continue;
+                };
+                site = loadSite(allocator, dir) catch site;
+                const rebuilt = captureProjectSnapshot(allocator, dir, site) catch |err| {
+                    stderr("watch error: post-build scan failed: {t}\n", .{err}) catch {};
+                    reload_state.mark(.failed);
+                    continue;
+                };
+                previous.deinit();
+                previous = rebuilt;
+                reload_state.mark(.ok);
+                stdout("watch rebuild complete\n", .{}) catch {};
+            },
+        }
     }
 }
 
@@ -431,6 +464,147 @@ const DevReloadState = struct {
         };
     }
 };
+
+const WatchedFileKind = enum { config, content, layout, static_asset, unknown };
+const IncrementalBuildPlan = enum { full, static_assets };
+
+const FileSnapshotEntry = struct {
+    path: []const u8,
+    kind: WatchedFileKind,
+    hash: u64,
+};
+
+const FileChange = struct {
+    path: []const u8,
+    kind: WatchedFileKind,
+};
+
+const ProjectSnapshot = struct {
+    allocator: std.mem.Allocator,
+    entries: std.array_list.Managed(FileSnapshotEntry),
+
+    fn init(allocator: std.mem.Allocator) ProjectSnapshot {
+        return .{ .allocator = allocator, .entries = std.array_list.Managed(FileSnapshotEntry).init(allocator) };
+    }
+
+    fn deinit(self: *ProjectSnapshot) void {
+        for (self.entries.items) |entry| self.allocator.free(entry.path);
+        self.entries.deinit();
+    }
+};
+
+fn captureProjectSnapshot(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !ProjectSnapshot {
+    var snapshot = ProjectSnapshot.init(allocator);
+    errdefer snapshot.deinit();
+    try snapshotPath(allocator, &snapshot, try join(allocator, &.{ dir, "zlog.ziggy" }), .config);
+    try snapshotPath(allocator, &snapshot, try join(allocator, &.{ dir, site.content_dir }), .content);
+    try snapshotPath(allocator, &snapshot, try join(allocator, &.{ dir, site.layouts_dir }), .layout);
+    try snapshotPath(allocator, &snapshot, try join(allocator, &.{ dir, "static" }), .static_asset);
+    return snapshot;
+}
+
+fn snapshotPath(allocator: std.mem.Allocator, snapshot: *ProjectSnapshot, path: []const u8, kind: WatchedFileKind) !void {
+    defer allocator.free(path);
+    const stat = std.Io.Dir.cwd().statFile(runtime_io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (stat.kind == .file) {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(path);
+        hashFileStat(&hasher, stat);
+        try snapshot.entries.append(.{ .path = try snapshot.allocator.dupe(u8, path), .kind = kind, .hash = hasher.final() });
+        return;
+    }
+    if (stat.kind != .directory) return;
+
+    var dir_handle = std.Io.Dir.cwd().openDir(runtime_io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir_handle.close(runtime_io);
+
+    var it = dir_handle.iterate();
+    while (try it.next(runtime_io)) |entry| {
+        if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
+        try snapshotPath(allocator, snapshot, try join(allocator, &.{ path, entry.name }), kind);
+    }
+}
+
+fn changedFiles(allocator: std.mem.Allocator, previous: ProjectSnapshot, next: ProjectSnapshot) ![]FileChange {
+    var changes = std.array_list.Managed(FileChange).init(allocator);
+    errdefer {
+        for (changes.items) |change| allocator.free(change.path);
+        changes.deinit();
+    }
+    for (next.entries.items) |entry| {
+        const before = findSnapshotEntry(previous, entry.path);
+        if (before == null or before.?.hash != entry.hash or before.?.kind != entry.kind) {
+            try changes.append(.{ .path = try allocator.dupe(u8, entry.path), .kind = entry.kind });
+        }
+    }
+    for (previous.entries.items) |entry| {
+        if (findSnapshotEntry(next, entry.path) == null) {
+            try changes.append(.{ .path = try allocator.dupe(u8, entry.path), .kind = entry.kind });
+        }
+    }
+    return changes.toOwnedSlice();
+}
+
+fn findSnapshotEntry(snapshot: ProjectSnapshot, path: []const u8) ?FileSnapshotEntry {
+    for (snapshot.entries.items) |entry| {
+        if (std.mem.eql(u8, entry.path, path)) return entry;
+    }
+    return null;
+}
+
+fn freeFileChanges(allocator: std.mem.Allocator, changes: []FileChange) void {
+    for (changes) |change| allocator.free(change.path);
+    allocator.free(changes);
+}
+
+fn planIncrementalBuild(changes: []const FileChange) IncrementalBuildPlan {
+    if (changes.len == 0) return .full;
+    for (changes) |change| {
+        if (change.kind != .static_asset) return .full;
+    }
+    return .static_assets;
+}
+
+fn copyChangedStaticAssets(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, changes: []const FileChange) !void {
+    const static_dir = try join(allocator, &.{ dir, "static" });
+    defer allocator.free(static_dir);
+    const out_dir = try join(allocator, &.{ dir, site.out_dir });
+    defer allocator.free(out_dir);
+    for (changes) |change| {
+        if (change.kind != .static_asset) continue;
+        const rel = staticAssetRelativePath(change.path, static_dir) orelse continue;
+        if (rel.len == 0) continue;
+        const out_path = try join(allocator, &.{ out_dir, rel });
+        defer allocator.free(out_path);
+        const data = std.Io.Dir.cwd().readFileAlloc(runtime_io, change.path, allocator, .limited(32 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.Io.Dir.cwd().deleteFile(runtime_io, out_path) catch |delete_err| switch (delete_err) {
+                    error.FileNotFound => {},
+                    else => return delete_err,
+                };
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(data);
+        try writeAll(allocator, out_path, data);
+    }
+}
+
+fn staticAssetRelativePath(path: []const u8, static_dir: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, path, static_dir)) return null;
+    if (path.len == static_dir.len) return "";
+    const rest = path[static_dir.len..];
+    const separator = std.Io.Dir.path.sep_str;
+    if (!std.mem.startsWith(u8, rest, separator)) return null;
+    return rest[separator.len..];
+}
 
 fn projectFingerprint(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig) !u64 {
     var hasher = std.hash.Wyhash.init(0);
@@ -5092,6 +5266,55 @@ test "dev reload state records successful and failed rebuilds" {
     const recovered = state.snapshot();
     try std.testing.expectEqual(DevBuildStatus.ok, recovered.status);
     try std.testing.expect(recovered.version > failed.version);
+}
+
+test "incremental build plan uses static asset fast path only when safe" {
+    const static_only = [_]FileChange{.{
+        .path = "site/static/app.css",
+        .kind = .static_asset,
+    }};
+    try std.testing.expectEqual(IncrementalBuildPlan.static_assets, planIncrementalBuild(static_only[0..]));
+
+    const content_change = [_]FileChange{.{
+        .path = "site/content/index.md",
+        .kind = .content,
+    }};
+    try std.testing.expectEqual(IncrementalBuildPlan.full, planIncrementalBuild(content_change[0..]));
+
+    const mixed = [_]FileChange{
+        .{ .path = "site/static/app.css", .kind = .static_asset },
+        .{ .path = "site/layouts/base.shtml", .kind = .layout },
+    };
+    try std.testing.expectEqual(IncrementalBuildPlan.full, planIncrementalBuild(mixed[0..]));
+}
+
+test "static asset relative paths require a directory boundary" {
+    try std.testing.expectEqualStrings("assets/app.css", staticAssetRelativePath("site/static/assets/app.css", "site/static").?);
+    try std.testing.expect(staticAssetRelativePath("site/staticity/app.css", "site/static") == null);
+}
+
+test "incremental static asset copy updates and removes output files" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "site/static/assets");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "site/static/assets/app.css", .data = "body{color:red}" });
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    const source_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/static/assets/app.css", .{root});
+    defer std.testing.allocator.free(source_path);
+    const changes = [_]FileChange{.{ .path = source_path, .kind = .static_asset }};
+
+    try copyChangedStaticAssets(std.testing.allocator, root, .{}, changes[0..]);
+    const copied_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/public/assets/app.css", .{root});
+    defer std.testing.allocator.free(copied_path);
+    const copied = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, copied_path, std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("body{color:red}", copied);
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, source_path);
+    try copyChangedStaticAssets(std.testing.allocator, root, .{}, changes[0..]);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, copied_path, .{}));
 }
 
 test "project fingerprint changes when watched inputs change" {
