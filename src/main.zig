@@ -197,6 +197,7 @@ fn cmdCheck(allocator: std.mem.Allocator, dir: []const u8) !void {
     var routes = try buildRouteGraph(allocator, dir, site, pages.items);
     defer routes.deinit();
     try validatePages(allocator, pages.items, routes);
+    try validateRenderedHtml(allocator, dir, site, pages.items, routes);
     try stdout("check ok: {d} pages\n", .{pages.items.len});
 }
 
@@ -218,15 +219,9 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
 
     for (pages.items) |page| {
         if (page.fm.draft) continue;
-        const layout_name = if (page.fm.layout.len == 0) "base.shtml" else page.fm.layout;
-        const layout_path = try join(allocator, &.{ dir, site.layouts_dir, layout_name });
-        const layout = std.Io.Dir.cwd().readFileAlloc(runtime_io, layout_path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
-            error.FileNotFound => if (page.is_post) initPostLayout else initBaseLayout,
-            else => return err,
-        };
-        const rendered = try renderLayout(allocator, layout, site, page, page.html, post_list, head, runtime);
-        const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
         const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
+        const layout = try loadLayoutForPage(allocator, dir, site, page);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path);
         try writeAll(allocator, route.out_path, final_html);
     }
 
@@ -237,6 +232,82 @@ fn cmdBuild(allocator: std.mem.Allocator, dir: []const u8) !void {
     const sitemap_route = routes.firstByKind(.sitemap) orelse return fail("missing sitemap route", .{});
     try writeAll(allocator, sitemap_route.out_path, try renderSitemap(allocator, routes));
     try stdout("built {d} pages into {s}\n", .{ countPublishedPages(pages.items), out_dir });
+}
+
+const LayoutSource = struct {
+    path: []const u8,
+    html: []const u8,
+};
+
+fn loadLayoutForPage(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, page: Page) !LayoutSource {
+    const layout_name = if (page.fm.layout.len == 0) "base.shtml" else page.fm.layout;
+    const layout_path = try join(allocator, &.{ dir, site.layouts_dir, layout_name });
+    const layout = std.Io.Dir.cwd().readFileAlloc(runtime_io, layout_path, allocator, .limited(4 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => if (page.is_post) initPostLayout else initBaseLayout,
+        else => return err,
+    };
+    return .{ .path = layout_path, .html = layout };
+}
+
+fn validateRenderedHtml(allocator: std.mem.Allocator, dir: []const u8, site: SiteConfig, pages: []Page, routes: RouteGraph) !void {
+    const post_list = try renderPostList(allocator, pages, site);
+    const head = renderHead(site);
+    const runtime = prefetchRuntime;
+
+    for (pages) |page| {
+        if (page.fm.draft) continue;
+        const route = findPageRoute(routes, page.url) orelse return fail("missing route for {s}", .{page.url});
+        const layout = try loadLayoutForPage(allocator, dir, site, page);
+        const final_html = try renderPageOutputHtml(allocator, layout, site, page, page.html, post_list, head, runtime, route.out_path);
+        allocator.free(final_html);
+    }
+
+    try validateGeneratedListingHtml(allocator, routes, pages, site, head, runtime);
+}
+
+fn renderPageOutputHtml(allocator: std.mem.Allocator, layout: LayoutSource, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8, output_path: []const u8) ![]const u8 {
+    try validateHtmlDocument(allocator, layout.html, layout.path);
+    const rendered = try renderLayout(allocator, layout.html, site, page, content, post_list, head, runtime);
+    defer allocator.free(rendered);
+    const final_html = try rewriteNavigationAttributes(allocator, rendered, site.prefetch_default);
+    errdefer allocator.free(final_html);
+    try validateHtmlDocument(allocator, final_html, output_path);
+    return final_html;
+}
+
+fn validateGeneratedListingHtml(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+    var seen = std.StringHashMap(void).init(allocator);
+    defer {
+        var keys = seen.keyIterator();
+        while (keys.next()) |tag_slug| allocator.free(tag_slug.*);
+        seen.deinit();
+    }
+
+    for (pages) |p| {
+        if (!p.is_post or p.fm.draft) continue;
+        for (p.fm.tags) |tag| {
+            const tag_slug = try slugify(allocator, tag);
+            if (seen.contains(tag_slug)) {
+                allocator.free(tag_slug);
+                continue;
+            }
+            seen.put(tag_slug, {}) catch |err| {
+                allocator.free(tag_slug);
+                return err;
+            };
+            const tag_url = try std.fmt.allocPrint(allocator, "/tags/{s}/", .{tag_slug});
+            defer allocator.free(tag_url);
+            const route = findRoute(routes, .tag, tag_url) orelse return fail("missing tag route for {s}", .{tag_url});
+            const rendered = try renderTagPageHtml(allocator, tag, tag_slug, pages, site, head, runtime);
+            defer allocator.free(rendered);
+            try validateHtmlDocument(allocator, rendered, route.out_path);
+        }
+    }
+
+    const archive_route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
+    const archive = try renderArchivePageHtml(allocator, pages, site, head, runtime);
+    defer allocator.free(archive);
+    try validateHtmlDocument(allocator, archive, archive_route.out_path);
 }
 
 fn loadSite(allocator: std.mem.Allocator, dir: []const u8) !SiteConfig {
@@ -994,6 +1065,17 @@ const ClosingTag = struct {
     end: usize,
 };
 
+const HtmlOpenTag = struct {
+    name: []const u8,
+    line: usize,
+    column: usize,
+};
+
+const SourceLocation = struct {
+    line: usize,
+    column: usize,
+};
+
 fn renderLayout(allocator: std.mem.Allocator, layout: []const u8, site: SiteConfig, page: Page, content: []const u8, post_list: []const u8, head: []const u8, runtime: []const u8) ![]const u8 {
     const page_tags = try renderTagsInline(allocator, page.fm.tags);
     defer allocator.free(page_tags);
@@ -1197,32 +1279,62 @@ fn templateAttrValue(tag: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn validateTemplateStructure(allocator: std.mem.Allocator, html: []const u8) !void {
-    var stack = std.array_list.Managed([]const u8).init(allocator);
+    try validateHtmlDocument(allocator, html, "<template>");
+}
+
+fn validateHtmlDocument(allocator: std.mem.Allocator, html: []const u8, path: []const u8) !void {
+    var stack = std.array_list.Managed(HtmlOpenTag).init(allocator);
     defer stack.deinit();
     var i: usize = 0;
     while (std.mem.indexOfScalarPos(u8, html, i, '<')) |lt| {
         if (std.mem.startsWith(u8, html[lt..], "<!--")) {
-            const end = std.mem.indexOf(u8, html[lt + 4 ..], "-->") orelse return fail("invalid template HTML comment", .{});
+            const end = std.mem.indexOf(u8, html[lt + 4 ..], "-->") orelse {
+                const loc = sourceLocationAt(html, lt);
+                return failAt(path, loc.line, loc.column, "unterminated HTML comment", .{});
+            };
             i = lt + 4 + end + 3;
             continue;
         }
-        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return fail("invalid template HTML structure", .{});
+        const loc = sourceLocationAt(html, lt);
+        const gt = std.mem.indexOfScalarPos(u8, html, lt, '>') orelse return failAt(path, loc.line, loc.column, "unterminated HTML tag", .{});
         const tag = html[lt .. gt + 1];
         if (tag.len >= 2 and (tag[1] == '!' or tag[1] == '?')) {
             i = gt + 1;
             continue;
         }
         if (closingTagName(tag)) |name| {
-            if (stack.items.len == 0) return fail("unexpected closing tag </{s}>", .{name});
+            if (stack.items.len == 0) return failAt(path, loc.line, loc.column, "unexpected closing tag </{s}>", .{name});
             const open = stack.items[stack.items.len - 1];
-            if (!std.ascii.eqlIgnoreCase(open, name)) return fail("closing tag </{s}> does not match <{s}>", .{ name, open });
+            if (!std.ascii.eqlIgnoreCase(open.name, name)) return failAt(path, loc.line, loc.column, "closing tag </{s}> does not match <{s}> opened at {d}:{d}", .{ name, open.name, open.line, open.column });
             _ = stack.pop();
         } else if (startTagName(tag)) |name| {
-            if (!isSelfClosingTag(tag) and !isVoidHtmlTag(name)) try stack.append(name);
+            if (isRawTextHtmlTag(name)) {
+                const close = findClosingTag(html, gt + 1, name) orelse return failAt(path, loc.line, loc.column, "missing closing tag for <{s}>", .{name});
+                i = close.end;
+                continue;
+            }
+            if (!isSelfClosingTag(tag) and !isVoidHtmlTag(name)) try stack.append(.{ .name = name, .line = loc.line, .column = loc.column });
         }
         i = gt + 1;
     }
-    if (stack.items.len > 0) return fail("unclosed template tag <{s}>", .{stack.items[stack.items.len - 1]});
+    if (stack.items.len > 0) {
+        const open = stack.items[stack.items.len - 1];
+        return failAt(path, open.line, open.column, "unclosed HTML tag <{s}>", .{open.name});
+    }
+}
+
+fn sourceLocationAt(text: []const u8, index: usize) SourceLocation {
+    var line: usize = 1;
+    var column: usize = 1;
+    for (text[0..index]) |c| {
+        if (c == '\n') {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    return .{ .line = line, .column = column };
 }
 
 fn startTagName(tag: []const u8) ?[]const u8 {
@@ -1253,6 +1365,10 @@ fn isVoidHtmlTag(name: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(name, void_name)) return true;
     }
     return false;
+}
+
+fn isRawTextHtmlTag(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "script") or std.ascii.eqlIgnoreCase(name, "style");
 }
 
 fn findClosingTag(html: []const u8, start: usize, name: []const u8) ?ClosingTag {
@@ -1365,29 +1481,46 @@ fn renderTagPages(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Pag
             const tag_url = try std.fmt.allocPrint(allocator, "/tags/{s}/", .{tag_slug});
             defer allocator.free(tag_url);
             const route = findRoute(routes, .tag, tag_url) orelse return fail("missing tag route for {s}", .{tag_url});
-            var body = std.array_list.Managed(u8).init(allocator);
-            try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
-            for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
-                try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
-            };
-            try body.appendSlice("</ul>");
-            const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-            const layout = initBaseLayout;
-            const rendered = try renderLayout(allocator, layout, site, fake, try body.toOwnedSlice(), "", head, runtime);
+            const rendered = try renderTagPageHtml(allocator, tag, tag_slug, pages, site, head, runtime);
+            defer allocator.free(rendered);
+            try validateHtmlDocument(allocator, rendered, route.out_path);
             try writeAll(allocator, route.out_path, rendered);
         }
     }
 }
 
+fn renderTagPageHtml(allocator: std.mem.Allocator, tag: []const u8, tag_slug: []const u8, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) ![]const u8 {
+    var body = std.array_list.Managed(u8).init(allocator);
+    try body.print("<h1>#{s}</h1>\n<ul>\n", .{tag});
+    for (pages) |q| if (q.is_post and !q.fm.draft and hasTag(q, tag)) {
+        try body.print("<li><a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ q.url, q.fm.title });
+    };
+    try body.appendSlice("</ul>");
+    const body_html = try body.toOwnedSlice();
+    defer allocator.free(body_html);
+
+    const fake = Page{ .source_path = "", .slug = tag_slug, .url = "", .fm = .{ .title = tag, .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
+    return renderLayout(allocator, initBaseLayout, site, fake, body_html, "", head, runtime);
+}
+
 fn renderArchivePage(allocator: std.mem.Allocator, routes: RouteGraph, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) !void {
+    const rendered = try renderArchivePageHtml(allocator, pages, site, head, runtime);
+    defer allocator.free(rendered);
+    const route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
+    try validateHtmlDocument(allocator, rendered, route.out_path);
+    try writeAll(allocator, route.out_path, rendered);
+}
+
+fn renderArchivePageHtml(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig, head: []const u8, runtime: []const u8) ![]const u8 {
     var body = std.array_list.Managed(u8).init(allocator);
     try body.appendSlice("<h1>Archive</h1>\n<ul>\n");
     for (pages) |p| if (p.is_post and !p.fm.draft) try body.print("<li><time>{s}</time> <a href=\"{s}\" data-z-prefetch=\"hover\">{s}</a></li>\n", .{ p.fm.date, p.url, p.fm.title });
     try body.appendSlice("</ul>");
+    const body_html = try body.toOwnedSlice();
+    defer allocator.free(body_html);
+
     const fake = Page{ .source_path = "", .slug = "archive", .url = "/archive/", .fm = .{ .title = "Archive", .layout = "base.shtml" }, .markdown = "", .html = "", .is_post = false };
-    const rendered = try renderLayout(allocator, initBaseLayout, site, fake, try body.toOwnedSlice(), "", head, runtime);
-    const route = routes.firstByKind(.archive) orelse return fail("missing archive route", .{});
-    try writeAll(allocator, route.out_path, rendered);
+    return renderLayout(allocator, initBaseLayout, site, fake, body_html, "", head, runtime);
 }
 
 fn renderRss(allocator: std.mem.Allocator, pages: []Page, site: SiteConfig) ![]const u8 {
@@ -1783,6 +1916,36 @@ test "template renderer rejects invalid structure and legacy tokens" {
     };
     try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main><p></main>", ctx));
     try std.testing.expectError(error.InvalidSite, renderTemplate(std.testing.allocator, "<main>{{content}}</main>", ctx));
+}
+
+test "html validator reports malformed generated markup" {
+    try validateHtmlDocument(std.testing.allocator, "<main><p>Body</p><img src=\"/a.png\"></main>", "public/index.html");
+    try std.testing.expectError(error.InvalidSite, validateHtmlDocument(std.testing.allocator, "<main>\n<p>Body</main>", "public/index.html"));
+    try std.testing.expectError(error.InvalidSite, validateHtmlDocument(std.testing.allocator, "<main><section></section>", "public/index.html"));
+}
+
+test "html validation covers generated listing pages during check" {
+    runtime_io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/site", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var pages = [_]Page{
+        .{
+            .source_path = "content/posts/post.md",
+            .slug = "post",
+            .url = "/post/",
+            .fm = .{ .title = "Post", .date = "2026-06-27", .tags = &[_][]const u8{"bad</h1>"} },
+            .markdown = "# Post",
+            .html = "<h1 id=\"post\">Post</h1>",
+            .is_post = true,
+        },
+    };
+
+    var routes = try buildRouteGraph(std.testing.allocator, root, .{}, pages[0..]);
+    defer routes.deinit();
+    try std.testing.expectError(error.InvalidSite, validateGeneratedListingHtml(std.testing.allocator, routes, pages[0..], .{}, renderHead(.{}), prefetchRuntime));
 }
 
 test "markdown renderer emits headings paragraphs and links" {
