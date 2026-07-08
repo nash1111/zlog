@@ -20,6 +20,47 @@ const Frontmatter = struct {
     transition: []const u8 = "",
 };
 
+const Heading = struct {
+    level: usize,
+    id: []const u8,
+    title: []const u8,
+};
+
+const cmark = struct {
+    const node = opaque {};
+    const parser = opaque {};
+    const iter = opaque {};
+    const syntax_extension = opaque {};
+    const llist = opaque {};
+
+    extern fn cmark_gfm_core_extensions_ensure_registered() void;
+    extern fn cmark_find_syntax_extension(name: [*:0]const u8) ?*syntax_extension;
+    extern fn cmark_parser_new(options: c_int) ?*parser;
+    extern fn cmark_parser_free(parser: *parser) void;
+    extern fn cmark_parser_feed(parser: *parser, buffer: [*]const u8, len: usize) void;
+    extern fn cmark_parser_finish(parser: *parser) ?*node;
+    extern fn cmark_parser_attach_syntax_extension(parser: *parser, extension: *syntax_extension) c_int;
+    extern fn cmark_parser_get_syntax_extensions(parser: *parser) ?*llist;
+    extern fn cmark_render_html(root: *node, options: c_int, extensions: ?*llist) ?[*:0]u8;
+    extern fn cmark_node_free(node: *node) void;
+    extern fn cmark_node_get_type(node: *node) c_int;
+    extern fn cmark_node_get_heading_level(node: *node) c_int;
+    extern fn cmark_node_get_string_content(node: *node) ?[*:0]const u8;
+    extern fn cmark_iter_new(root: *node) ?*iter;
+    extern fn cmark_iter_next(iter: *iter) c_int;
+    extern fn cmark_iter_get_node(iter: *iter) ?*node;
+    extern fn cmark_iter_free(iter: *iter) void;
+    extern fn free(ptr: ?*anyopaque) void;
+};
+
+const CMARK_NODE_HEADING: c_int = 0x8000 | 0x0009;
+const CMARK_EVENT_DONE: c_int = 1;
+const CMARK_EVENT_ENTER: c_int = 2;
+const CMARK_OPT_VALIDATE_UTF8: c_int = 1 << 9;
+const CMARK_OPT_FOOTNOTES: c_int = 1 << 13;
+const CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE: c_int = 1 << 14;
+const CMARK_OPT_TABLE_PREFER_STYLE_ATTRIBUTES: c_int = 1 << 15;
+
 const Page = struct {
     source_path: []const u8,
     slug: []const u8,
@@ -272,78 +313,117 @@ fn parseStringArrayField(allocator: std.mem.Allocator, text: []const u8, name: [
 }
 
 fn markdownToHtml(allocator: std.mem.Allocator, markdown: []const u8) ![]const u8 {
+    const options: c_int = CMARK_OPT_VALIDATE_UTF8 | CMARK_OPT_FOOTNOTES | CMARK_OPT_STRIKETHROUGH_DOUBLE_TILDE | CMARK_OPT_TABLE_PREFER_STYLE_ATTRIBUTES;
+    var headings = std.array_list.Managed(Heading).init(allocator);
+    defer freeHeadings(allocator, &headings);
+
+    cmark.cmark_gfm_core_extensions_ensure_registered();
+    const parser = cmark.cmark_parser_new(options) orelse return error.MarkdownParserUnavailable;
+    defer cmark.cmark_parser_free(parser);
+    try attachCmarkExtensions(parser);
+
+    if (markdown.len > 0) cmark.cmark_parser_feed(parser, markdown.ptr, markdown.len);
+    const root = cmark.cmark_parser_finish(parser) orelse return error.MarkdownParserUnavailable;
+    defer cmark.cmark_node_free(root);
+
+    try collectCmarkHeadings(allocator, root, &headings);
+
+    const html_c = cmark.cmark_render_html(root, options, cmark.cmark_parser_get_syntax_extensions(parser)) orelse return error.MarkdownParserUnavailable;
+    defer cmark.free(@ptrCast(html_c));
+    const rendered = try allocator.dupe(u8, std.mem.span(html_c));
+    defer allocator.free(rendered);
+
+    const with_heading_ids = try addHeadingIdsToHtml(allocator, rendered, headings.items);
+    defer allocator.free(with_heading_ids);
+    return addPrefetchPlaceholders(allocator, with_heading_ids);
+}
+
+fn attachCmarkExtensions(parser: *cmark.parser) !void {
+    const extension_names = [_][*:0]const u8{ "table", "strikethrough", "autolink", "tagfilter", "tasklist" };
+    for (extension_names) |name| {
+        const extension = cmark.cmark_find_syntax_extension(name) orelse return error.MarkdownExtensionUnavailable;
+        if (cmark.cmark_parser_attach_syntax_extension(parser, extension) == 0) return error.MarkdownExtensionUnavailable;
+    }
+}
+
+fn collectCmarkHeadings(allocator: std.mem.Allocator, root: *cmark.node, headings: *std.array_list.Managed(Heading)) !void {
+    const it = cmark.cmark_iter_new(root) orelse return error.MarkdownParserUnavailable;
+    defer cmark.cmark_iter_free(it);
+
+    while (true) {
+        const event = cmark.cmark_iter_next(it);
+        if (event == CMARK_EVENT_DONE) break;
+        if (event != CMARK_EVENT_ENTER) continue;
+
+        const current = cmark.cmark_iter_get_node(it) orelse continue;
+        if (cmark.cmark_node_get_type(current) != CMARK_NODE_HEADING) continue;
+
+        const level: usize = @intCast(cmark.cmark_node_get_heading_level(current));
+        if (level == 0) continue;
+        const raw_title = if (cmark.cmark_node_get_string_content(current)) |title| std.mem.span(title) else "";
+        const title = try allocator.dupe(u8, raw_title);
+        errdefer allocator.free(title);
+        const id = try slugify(allocator, raw_title);
+        errdefer allocator.free(id);
+        try headings.append(.{ .level = level, .id = id, .title = title });
+    }
+}
+
+fn freeHeadings(allocator: std.mem.Allocator, headings: *std.array_list.Managed(Heading)) void {
+    for (headings.items) |heading| {
+        allocator.free(heading.id);
+        allocator.free(heading.title);
+    }
+    headings.deinit();
+}
+
+fn addHeadingIdsToHtml(allocator: std.mem.Allocator, html: []const u8, headings: []const Heading) ![]const u8 {
     var out = std.array_list.Managed(u8).init(allocator);
-    var in_list = false;
-    var lines = std.mem.splitScalar(u8, markdown, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (std.mem.trim(u8, line, " \t").len == 0) {
-            if (in_list) {
-                try out.appendSlice("</ul>\n");
-                in_list = false;
+    var i: usize = 0;
+    var heading_index: usize = 0;
+    while (i < html.len) {
+        if (i + 3 < html.len and html[i] == '<' and html[i + 1] == 'h' and html[i + 2] >= '1' and html[i + 2] <= '6' and (html[i + 3] == '>' or std.ascii.isWhitespace(html[i + 3]))) {
+            const end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+            const tag = html[i .. end + 1];
+            if (heading_index < headings.len and std.mem.indexOf(u8, tag, " id=") == null) {
+                try out.appendSlice(html[i..end]);
+                try out.print(" id=\"{s}\">", .{headings[heading_index].id});
+            } else {
+                try out.appendSlice(tag);
             }
+            heading_index += 1;
+            i = end + 1;
             continue;
         }
-        if (std.mem.startsWith(u8, line, "#")) {
-            if (in_list) {
-                try out.appendSlice("</ul>\n");
-                in_list = false;
-            }
-            var level: usize = 0;
-            while (level < line.len and line[level] == '#') level += 1;
-            if (level > 6) level = 6;
-            const title = std.mem.trimStart(u8, line[level..], " ");
-            const id = try slugify(allocator, title);
-            defer allocator.free(id);
-            try out.print("<h{d} id=\"{s}\">", .{ level, id });
-            try appendEscaped(&out, title);
-            try out.print("</h{d}>\n", .{level});
-        } else if (std.mem.startsWith(u8, line, "- ")) {
-            if (!in_list) {
-                try out.appendSlice("<ul>\n");
-                in_list = true;
-            }
-            try out.appendSlice("<li>");
-            try renderInlineMarkdown(allocator, &out, line[2..]);
-            try out.appendSlice("</li>\n");
-        } else {
-            if (in_list) {
-                try out.appendSlice("</ul>\n");
-                in_list = false;
-            }
-            try out.appendSlice("<p>");
-            try renderInlineMarkdown(allocator, &out, line);
-            try out.appendSlice("</p>\n");
-        }
+        try out.append(html[i]);
+        i += 1;
     }
-    if (in_list) try out.appendSlice("</ul>\n");
+    if (i < html.len) try out.appendSlice(html[i..]);
     return out.toOwnedSlice();
 }
 
-fn renderInlineMarkdown(allocator: std.mem.Allocator, out: *std.array_list.Managed(u8), text: []const u8) !void {
+fn addPrefetchPlaceholders(allocator: std.mem.Allocator, html: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(allocator);
     var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '[') {
-            if (std.mem.indexOfScalarPos(u8, text, i, ']')) |close_label| {
-                if (close_label + 1 < text.len and text[close_label + 1] == '(') {
-                    if (std.mem.indexOfScalarPos(u8, text, close_label + 2, ')')) |close_url| {
-                        const label = text[i + 1 .. close_label];
-                        const url = text[close_label + 2 .. close_url];
-                        try out.appendSlice("<a href=\"");
-                        try appendEscaped(out, url);
-                        try out.appendSlice("\" data-z-prefetch>");
-                        try appendEscaped(out, label);
-                        try out.appendSlice("</a>");
-                        i = close_url + 1;
-                        _ = allocator;
-                        continue;
-                    }
-                }
+    while (i < html.len) {
+        if (std.mem.startsWith(u8, html[i..], "<a ")) {
+            const end = std.mem.indexOfScalarPos(u8, html, i, '>') orelse break;
+            const tag = html[i .. end + 1];
+            if (std.mem.indexOf(u8, tag, " href=") != null and std.mem.indexOf(u8, tag, "data-z-prefetch") == null) {
+                try out.appendSlice(html[i..end]);
+                try out.appendSlice(" data-z-prefetch>");
+            } else {
+                try out.appendSlice(tag);
             }
+            i = end + 1;
+            continue;
+        } else {
+            try out.append(html[i]);
+            i += 1;
         }
-        try appendEscapedChar(out, text[i]);
-        i += 1;
     }
+    if (i < html.len) try out.appendSlice(html[i..]);
+    return out.toOwnedSlice();
 }
 
 fn validatePages(allocator: std.mem.Allocator, pages: []Page) !void {
@@ -685,6 +765,37 @@ test "markdown renderer emits headings paragraphs and links" {
     defer std.testing.allocator.free(html);
     try std.testing.expect(std.mem.indexOf(u8, html, "<h1 id=\"hello\">Hello</h1>") != null);
     try std.testing.expect(std.mem.indexOf(u8, html, "data-z-prefetch") != null);
+}
+
+test "markdown renderer handles fenced code tables and emphasis" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\| Name | Value |
+        \\| --- | --- |
+        \\| **zlog** | https://example.com |
+        \\
+        \\```zig
+        \\const x = 1;
+        \\```
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<table>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "language-zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<strong>zlog</strong>") != null);
+}
+
+test "markdown renderer enables gfm strikethrough task lists and footnotes" {
+    const html = try markdownToHtml(std.testing.allocator,
+        \\- [x] shipped
+        \\- [ ] pending
+        \\
+        \\~~removed~~ text with a footnote.[^1]
+        \\
+        \\[^1]: Footnote body.
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expect(std.mem.indexOf(u8, html, "<del>removed</del>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "checkbox") != null);
+    try std.testing.expect(std.mem.indexOf(u8, html, "footnotes") != null);
 }
 
 test "transition names are safe css identifiers" {

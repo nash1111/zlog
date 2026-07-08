@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    linkMarkdownParser(root_module);
 
     const exe = b.addExecutable(.{
         .name = "zlog",
@@ -27,4 +28,10 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+fn linkMarkdownParser(module: *std.Build.Module) void {
+    module.link_libc = true;
+    module.linkSystemLibrary("cmark-gfm", .{});
+    module.linkSystemLibrary("cmark-gfm-extensions", .{});
 }
